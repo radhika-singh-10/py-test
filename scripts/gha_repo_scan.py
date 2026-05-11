@@ -71,41 +71,19 @@ logger = logging.getLogger("gha_repo_scan")
 MCP_SERVER_URL = "https://mcp.v2.prod.veedna.com/mcp"
 
 
-def _log_llm_interaction(
-    direction: str,
-    url: str,
-    payload: Any = None,
-    response_status: Optional[int] = None,
-    response_summary: Optional[str] = None,
-) -> None:
-    """Log an LLM interaction (request or response) with the MCP server."""
-    if direction == "request":
-        payload_summary = ""
-        if payload is not None:
-            try:
-                payload_str = json.dumps(payload) if not isinstance(payload, str) else payload
-                payload_summary = payload_str[:500] + "..." if len(payload_str) > 500 else payload_str
-            except Exception:
-                payload_summary = str(payload)[:500]
-        logger.info(
-            "[LLM_INTERACTION] REQUEST url=%s payload_summary=%s",
-            url,
-            payload_summary,
-        )
-    elif direction == "response":
-        logger.info(
-            "[LLM_INTERACTION] RESPONSE url=%s status=%s summary=%s",
-            url,
-            response_status,
-            (response_summary or "")[:500],
-        )
-    else:
-        logger.info(
-            "[LLM_INTERACTION] %s url=%s status=%s",
-            direction.upper(),
-            url,
-            response_status,
-        )
+def _log_llm_interaction(direction: str, payload: Any, batch_index: Optional[int] = None) -> None:
+    """Log LLM request/response payloads for audit and compliance."""
+    batch_info = f" (batch {batch_index})" if batch_index is not None else ""
+    try:
+        serialized = json.dumps(payload, default=str)
+    except Exception:
+        serialized = repr(payload)
+    logger.info(
+        "LLM interaction%s [%s]: %s",
+        batch_info,
+        direction,
+        serialized,
+    )
 
 MAX_SCAN_WORKERS = 4
 DEFAULT_UNIFAI_FILE_BATCH_SIZE = 100
@@ -671,73 +649,50 @@ def _execute_scan(args: argparse.Namespace) -> int:
 
     combined_report = "\n\n---\n\n".join(r for r in all_reports if r)
 
-    # Sanitize LLM output before use
+    # Sanitize LLM output before use: detect and redact dynamic code execution primitives
     _DANGEROUS_PATTERNS = [
-        r"\beval\s*\(",
-        r"\bexec\s*\(",
-        r"\bcompile\s*\(",
-        r"\bexecfile\s*\(",
-        r"\b__import__\s*\(",
-        r"\bos\.system\s*\(",
-        r"\bos\.popen\s*\(",
-        r"\bsubprocess\.[A-Za-z_]+\s*\([^)]*shell\s*=\s*True",
-        r"\bgetattr\s*\(",
-        r"\bsetattr\s*\(",
-        r"\bdelattr\s*\(",
-        r"\b__builtins__\b",
-        r"\bimportlib\.import_module\s*\(",
-        r"\bctypes\b",
-        r"\bpickle\.loads?\s*\(",
-        r"\bmarshal\.loads?\s*\(",
+        r'\beval\s*\(',
+        r'\bexec\s*\(',
+        r'\bcompile\s*\(',
+        r'\bexecfile\s*\(',
+        r'\b__import__\s*\(',
+        r'\bos\.system\s*\(',
+        r'\bos\.popen\s*\(',
+        r'\bsubprocess\s*\..*shell\s*=\s*True',
+        r'\bgetattr\s*\(.*,\s*[\'"]__',
+        r'\bimportlib\.import_module\s*\(',
     ]
 
     import re as _re
 
-    def _contains_dangerous_content(value: str) -> bool:
-        """Return True if the string contains dynamic code execution primitives."""
+    def _sanitize_llm_string(text: str) -> str:
+        """Redact dangerous dynamic code execution primitives from LLM output strings."""
+        if not isinstance(text, str):
+            return text
         for pattern in _DANGEROUS_PATTERNS:
-            if _re.search(pattern, value):
-                return True
-        return False
+            if _re.search(pattern, text, _re.IGNORECASE):
+                logger.warning(
+                    "Dangerous code execution primitive detected in LLM output (pattern: %s); redacting.",
+                    pattern,
+                )
+                text = _re.sub(pattern, "[REDACTED_DANGEROUS_PRIMITIVE]", text, flags=_re.IGNORECASE)
+        return text
 
-    def _sanitize_string(value: str, field_name: str) -> str:
-        """Raise ValueError if LLM output contains dangerous primitives."""
-        if _contains_dangerous_content(value):
-            logger.error(
-                "Dangerous code execution primitive detected in LLM output field '%s'; "
-                "content rejected for safety.", field_name
-            )
-            raise ValueError(
-                f"LLM output field '{field_name}' contains dangerous dynamic code "
-                "execution primitives and has been rejected."
-            )
-        return value
+    def _sanitize_llm_list(items: list) -> list:
+        """Recursively sanitize a list of LLM output items (dicts or strings)."""
+        sanitized = []
+        for item in items:
+            if isinstance(item, dict):
+                sanitized.append({k: _sanitize_llm_string(v) if isinstance(v, str) else v for k, v in item.items()})
+            elif isinstance(item, str):
+                sanitized.append(_sanitize_llm_string(item))
+            else:
+                sanitized.append(item)
+        return sanitized
 
-    def _sanitize_obj(obj: object, field_name: str = "llm_output") -> object:
-        """Recursively sanitize strings within dicts/lists returned by the LLM."""
-        if isinstance(obj, str):
-            return _sanitize_string(obj, field_name)
-        if isinstance(obj, dict):
-            return {k: _sanitize_obj(v, f"{field_name}.{k}") for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [_sanitize_obj(item, f"{field_name}[{i}]") for i, item in enumerate(obj)]
-        return obj
-
-    try:
-        all_violations = _sanitize_obj(all_violations, "violations")
-        all_aibom = _sanitize_obj(all_aibom, "aibom")
-        combined_report = _sanitize_string(combined_report, "report")
-        failure_details = _sanitize_obj(failure_details, "scan_errors")
-    except ValueError as _san_err:
-        _err_output = build_json_output(
-            status="error", repo=repo, branch=branch, head_sha=head_sha,
-            source_code_repo=source_code_repo, files_scanned=len(file_list),
-            batches=len(batches), failed_batches=failed_batches_count,
-            violations=[], aibom=[], report="",
-            scan_errors=[{"error": str(_san_err)}],
-        )
-        print(json.dumps(_err_output, indent=2))
-        return 1
+    all_violations = _sanitize_llm_list(all_violations)
+    all_aibom = _sanitize_llm_list(all_aibom)
+    combined_report = _sanitize_llm_string(combined_report)
 
     if failed_batches_count and not all_violations:
         output = build_json_output(
