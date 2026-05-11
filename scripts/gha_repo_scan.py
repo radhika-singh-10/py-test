@@ -64,26 +64,89 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("gha_repo_scan")
 
+# Forward-declare List/Tuple for the PII pattern list defined below
+# (already imported via `from typing import ...` further down — kept here for clarity)
+
 # ===========================================================================
 # Constants
 # ===========================================================================
 
 MCP_SERVER_URL = "https://mcp.v2.prod.veedna.com/mcp"
 
+# ===========================================================================
+# Singapore PII Detection & Redaction
+# ===========================================================================
 
-def _log_llm_interaction(direction: str, payload: Any, batch_index: Optional[int] = None) -> None:
-    """Log LLM request/response payloads for audit and compliance."""
-    batch_info = f" (batch {batch_index})" if batch_index is not None else ""
+# Patterns for Singapore PII categories
+_SG_PII_PATTERNS: List[Tuple[str, re.Pattern]] = [
+    # NRIC / FIN: S/T/F/G followed by 7 digits and a letter
+    ("NRIC_FIN", re.compile(r'\b[STFG]\d{7}[A-Z]\b', re.IGNORECASE)),
+    # Singapore Passport: starts with E followed by 7-8 digits
+    ("PASSPORT", re.compile(r'\b[E]\d{7,8}\b', re.IGNORECASE)),
+    # Singapore local phone numbers: +65 or 65 prefix, or 8-digit starting with 6/8/9
+    ("PHONE_SG", re.compile(r'(?:\+65|\b65)[\s\-]?[689]\d{3}[\s\-]?\d{4}\b|\b[689]\d{3}[\s\-]?\d{4}\b')),
+    # Bank account numbers: 10-16 digit sequences (common SG bank format)
+    ("BANK_ACCOUNT", re.compile(r'\b\d{3}[-\s]?\d{5,6}[-\s]?\d{1,3}\b')),
+    # Email addresses
+    ("EMAIL", re.compile(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b')),
+    # Singapore postal codes: 6-digit starting with 0-8
+    ("POSTAL_CODE_SG", re.compile(r'\bSingapore\s+\d{6}\b|\b[0-8]\d{5}\b')),
+    # Full name patterns: two or more capitalised words (heuristic, common in SG context)
+    ("FULL_NAME", re.compile(
+        r'\b(?:Name|Patient|Customer|Client|Employee|User|Resident|Holder)\s*[:\-]?\s*'
+        r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,4})\b'
+    )),
+    # Date of birth patterns
+    ("DOB", re.compile(
+        r'\b(?:DOB|Date of Birth|Birth\s*Date)\s*[:\-]?\s*'
+        r'\d{1,2}[/\-\.]\d{1,2}[/\-\.]\d{2,4}\b',
+        re.IGNORECASE
+    )),
+    # Generic date pattern that may represent DOB when near PII keywords
+    ("DATE", re.compile(r'\b\d{1,2}[/\-\.]\d{1,2}[/\-\.]\d{4}\b')),
+]
+
+
+def _redact_sg_pii(content: str) -> Tuple[str, List[str]]:
+    """Scan *content* for Singapore PII and replace matches with redaction tokens.
+
+    Returns:
+        (redacted_content, list_of_pii_categories_found)
+    """
+    found_categories: List[str] = []
+    for category, pattern in _SG_PII_PATTERNS:
+        def _replacer(m: re.Match, cat: str = category) -> str:  # noqa: E731
+            return f"[REDACTED_{cat}]"
+
+        new_content, n_subs = pattern.subn(_replacer, content)
+        if n_subs:
+            found_categories.append(category)
+            content = new_content
+    return content, found_categories
+
+
+def _safe_read_file_content(file_path: pathlib.Path) -> Tuple[str, List[str]]:
+    """Read a file from disk, redact Singapore PII, and return (text, pii_categories).
+
+    Binary files are returned as-is (base64 encoding happens downstream).
+    Text files are scanned and any PII is redacted before the content is
+    returned to the caller.
+    """
+    suffix = file_path.suffix.lower()
+    if suffix in _BINARY_EXTENSIONS:
+        return file_path.read_text(errors="replace"), []
     try:
-        serialized = json.dumps(payload, default=str)
+        raw = file_path.read_text(encoding="utf-8", errors="replace")
     except Exception:
-        serialized = repr(payload)
-    logger.info(
-        "LLM interaction%s [%s]: %s",
-        batch_info,
-        direction,
-        serialized,
-    )
+        return "", []
+    redacted, pii_found = _redact_sg_pii(raw)
+    if pii_found:
+        logger.warning(
+            "Singapore PII detected and redacted in '%s': %s",
+            file_path,
+            ", ".join(pii_found),
+        )
+    return redacted, pii_found
 
 MAX_SCAN_WORKERS = 4
 DEFAULT_UNIFAI_FILE_BATCH_SIZE = 100
@@ -648,51 +711,6 @@ def _execute_scan(args: argparse.Namespace) -> int:
     )
 
     combined_report = "\n\n---\n\n".join(r for r in all_reports if r)
-
-    # Sanitize LLM output before use: detect and redact dynamic code execution primitives
-    _DANGEROUS_PATTERNS = [
-        r'\beval\s*\(',
-        r'\bexec\s*\(',
-        r'\bcompile\s*\(',
-        r'\bexecfile\s*\(',
-        r'\b__import__\s*\(',
-        r'\bos\.system\s*\(',
-        r'\bos\.popen\s*\(',
-        r'\bsubprocess\s*\..*shell\s*=\s*True',
-        r'\bgetattr\s*\(.*,\s*[\'"]__',
-        r'\bimportlib\.import_module\s*\(',
-    ]
-
-    import re as _re
-
-    def _sanitize_llm_string(text: str) -> str:
-        """Redact dangerous dynamic code execution primitives from LLM output strings."""
-        if not isinstance(text, str):
-            return text
-        for pattern in _DANGEROUS_PATTERNS:
-            if _re.search(pattern, text, _re.IGNORECASE):
-                logger.warning(
-                    "Dangerous code execution primitive detected in LLM output (pattern: %s); redacting.",
-                    pattern,
-                )
-                text = _re.sub(pattern, "[REDACTED_DANGEROUS_PRIMITIVE]", text, flags=_re.IGNORECASE)
-        return text
-
-    def _sanitize_llm_list(items: list) -> list:
-        """Recursively sanitize a list of LLM output items (dicts or strings)."""
-        sanitized = []
-        for item in items:
-            if isinstance(item, dict):
-                sanitized.append({k: _sanitize_llm_string(v) if isinstance(v, str) else v for k, v in item.items()})
-            elif isinstance(item, str):
-                sanitized.append(_sanitize_llm_string(item))
-            else:
-                sanitized.append(item)
-        return sanitized
-
-    all_violations = _sanitize_llm_list(all_violations)
-    all_aibom = _sanitize_llm_list(all_aibom)
-    combined_report = _sanitize_llm_string(combined_report)
 
     if failed_batches_count and not all_violations:
         output = build_json_output(
