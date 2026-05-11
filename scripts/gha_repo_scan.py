@@ -64,89 +64,36 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("gha_repo_scan")
 
-# Forward-declare List/Tuple for the PII pattern list defined below
-# (already imported via `from typing import ...` further down — kept here for clarity)
-
 # ===========================================================================
 # Constants
 # ===========================================================================
 
 MCP_SERVER_URL = "https://mcp.v2.prod.veedna.com/mcp"
 
-# ===========================================================================
-# Singapore PII Detection & Redaction
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# User-level authentication guard
+# ---------------------------------------------------------------------------
 
-# Patterns for Singapore PII categories
-_SG_PII_PATTERNS: List[Tuple[str, re.Pattern]] = [
-    # NRIC / FIN: S/T/F/G followed by 7 digits and a letter
-    ("NRIC_FIN", re.compile(r'\b[STFG]\d{7}[A-Z]\b', re.IGNORECASE)),
-    # Singapore Passport: starts with E followed by 7-8 digits
-    ("PASSPORT", re.compile(r'\b[E]\d{7,8}\b', re.IGNORECASE)),
-    # Singapore local phone numbers: +65 or 65 prefix, or 8-digit starting with 6/8/9
-    ("PHONE_SG", re.compile(r'(?:\+65|\b65)[\s\-]?[689]\d{3}[\s\-]?\d{4}\b|\b[689]\d{3}[\s\-]?\d{4}\b')),
-    # Bank account numbers: 10-16 digit sequences (common SG bank format)
-    ("BANK_ACCOUNT", re.compile(r'\b\d{3}[-\s]?\d{5,6}[-\s]?\d{1,3}\b')),
-    # Email addresses
-    ("EMAIL", re.compile(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b')),
-    # Singapore postal codes: 6-digit starting with 0-8
-    ("POSTAL_CODE_SG", re.compile(r'\bSingapore\s+\d{6}\b|\b[0-8]\d{5}\b')),
-    # Full name patterns: two or more capitalised words (heuristic, common in SG context)
-    ("FULL_NAME", re.compile(
-        r'\b(?:Name|Patient|Customer|Client|Employee|User|Resident|Holder)\s*[:\-]?\s*'
-        r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,4})\b'
-    )),
-    # Date of birth patterns
-    ("DOB", re.compile(
-        r'\b(?:DOB|Date of Birth|Birth\s*Date)\s*[:\-]?\s*'
-        r'\d{1,2}[/\-\.]\d{1,2}[/\-\.]\d{2,4}\b',
-        re.IGNORECASE
-    )),
-    # Generic date pattern that may represent DOB when near PII keywords
-    ("DATE", re.compile(r'\b\d{1,2}[/\-\.]\d{1,2}[/\-\.]\d{4}\b')),
-]
+def _enforce_user_authentication() -> None:
+    """Verify that a user identity credential is present before accessing the AI Agent.
 
+    Raises:
+        SystemExit(2): if the required user authentication credential is absent.
 
-def _redact_sg_pii(content: str) -> Tuple[str, List[str]]:
-    """Scan *content* for Singapore PII and replace matches with redaction tokens.
-
-    Returns:
-        (redacted_content, list_of_pii_categories_found)
+    The environment variable ``LINEAJE_USER_AUTH_TOKEN`` must be set to a
+    non-empty value that represents a validated user identity token.  This is
+    distinct from the service-level ``LINEAJE_PAT_TOKEN`` and ensures that a
+    real, authenticated user (not just any process with access to the service
+    PAT) is authorised to invoke the AI Agent.
     """
-    found_categories: List[str] = []
-    for category, pattern in _SG_PII_PATTERNS:
-        def _replacer(m: re.Match, cat: str = category) -> str:  # noqa: E731
-            return f"[REDACTED_{cat}]"
-
-        new_content, n_subs = pattern.subn(_replacer, content)
-        if n_subs:
-            found_categories.append(category)
-            content = new_content
-    return content, found_categories
-
-
-def _safe_read_file_content(file_path: pathlib.Path) -> Tuple[str, List[str]]:
-    """Read a file from disk, redact Singapore PII, and return (text, pii_categories).
-
-    Binary files are returned as-is (base64 encoding happens downstream).
-    Text files are scanned and any PII is redacted before the content is
-    returned to the caller.
-    """
-    suffix = file_path.suffix.lower()
-    if suffix in _BINARY_EXTENSIONS:
-        return file_path.read_text(errors="replace"), []
-    try:
-        raw = file_path.read_text(encoding="utf-8", errors="replace")
-    except Exception:
-        return "", []
-    redacted, pii_found = _redact_sg_pii(raw)
-    if pii_found:
-        logger.warning(
-            "Singapore PII detected and redacted in '%s': %s",
-            file_path,
-            ", ".join(pii_found),
+    user_auth_token = os.environ.get("LINEAJE_USER_AUTH_TOKEN", "").strip()
+    if not user_auth_token:
+        logger.error(
+            "User authentication required: LINEAJE_USER_AUTH_TOKEN is not set. "
+            "A valid user identity token must be provided before accessing the AI Agent."
         )
-    return redacted, pii_found
+        sys.exit(2)
+    logger.debug("User authentication check passed (LINEAJE_USER_AUTH_TOKEN is present).")
 
 MAX_SCAN_WORKERS = 4
 DEFAULT_UNIFAI_FILE_BATCH_SIZE = 100
@@ -682,6 +629,11 @@ def _execute_scan(args: argparse.Namespace) -> int:
     manifest_files = [f for f in file_list if _is_manifest_file(os.path.basename(f))]
     code_files = [f for f in file_list if not _is_manifest_file(os.path.basename(f))]
     scan_files = code_files if code_files else file_list
+
+    # --- Singapore PII detection & redaction ---
+    scan_files = _redact_sg_pii_in_files(scan_files, source_path)
+    # -------------------------------------------
+
     batch_size = _batch_size(len(scan_files))
     batches = [scan_files[i: i + batch_size] for i in range(0, len(scan_files), batch_size)]
     logger.info(
@@ -736,6 +688,99 @@ def _execute_scan(args: argparse.Namespace) -> int:
     )
     print(json.dumps(output, indent=2))
     return 0
+
+# ===========================================================================
+# Singapore PII detection & redaction
+# ===========================================================================
+
+import re as _re
+import shutil as _shutil
+
+# Patterns for Singapore PII categories
+_SG_PII_PATTERNS: list = [
+    # NRIC / FIN  (S/T/F/G followed by 7 digits and a letter)
+    (_re.compile(r'\b[STFG]\d{7}[A-Z]\b'), 'NRIC/FIN'),
+    # Singapore passport number  (E followed by 7 digits)
+    (_re.compile(r'\bE\d{7}[A-Z]\b'), 'Passport'),
+    # Singapore local phone numbers  (+65 or 65 prefix, or bare 8-digit starting with 6/8/9)
+    (_re.compile(r'(?:\+65|\b65)[\s-]?[689]\d{3}[\s-]?\d{4}\b'), 'SG Phone'),
+    (_re.compile(r'\b[689]\d{3}[\s-]?\d{4}\b'), 'SG Phone'),
+    # Bank account numbers  (10–12 consecutive digits, common SG bank format)
+    (_re.compile(r'\b\d{10,12}\b'), 'Bank Account'),
+    # Full name heuristic: two or more capitalised words on a "Name:" labelled line
+    (_re.compile(
+        r'(?i)(?:full[\s_-]?name|name)[\s]*[:=][\s]*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,4})'
+    ), 'Full Name'),
+]
+
+_REDACTION_PLACEHOLDER = '[REDACTED-SG-PII]'
+
+
+def _contains_sg_pii(text: str) -> list:
+    """Return a list of (pattern_name, match) tuples for any SG PII found in *text*."""
+    hits = []
+    for pattern, label in _SG_PII_PATTERNS:
+        for m in pattern.finditer(text):
+            hits.append((label, m.group()))
+    return hits
+
+
+def _redact_sg_pii(text: str) -> str:
+    """Replace all SG PII occurrences in *text* with a redaction placeholder."""
+    for pattern, _label in _SG_PII_PATTERNS:
+        text = pattern.sub(_REDACTION_PLACEHOLDER, text)
+    return text
+
+
+def _redact_sg_pii_in_files(
+    file_list: list,
+    source_path: str,
+) -> list:
+    """
+    Scan every file in *file_list* for Singapore PII.  Files that contain PII
+    are copied to a temporary directory with the sensitive content redacted;
+    the returned list replaces those paths with the redacted copies so that
+    raw PII is never transmitted to the external MCP server.
+    """
+    redacted_dir = tempfile.mkdtemp(prefix='gha-sg-pii-redact-')
+    cleaned: list = []
+    for fpath in file_list:
+        abs_path = fpath if os.path.isabs(fpath) else os.path.join(source_path, fpath)
+        try:
+            with open(abs_path, 'r', encoding='utf-8', errors='replace') as fh:
+                original_text = fh.read()
+        except OSError:
+            # Unreadable file — pass through unchanged; MCP will handle it.
+            cleaned.append(fpath)
+            continue
+
+        hits = _contains_sg_pii(original_text)
+        if not hits:
+            cleaned.append(fpath)
+            continue
+
+        # Log a warning for every PII category found
+        categories = ', '.join(sorted({label for label, _ in hits}))
+        logger.warning(
+            'Singapore PII detected in %s (categories: %s) — redacting before upload',
+            fpath, categories,
+        )
+
+        # Write redacted copy
+        rel = os.path.relpath(abs_path, source_path) if not os.path.isabs(fpath) else os.path.basename(fpath)
+        dest = os.path.join(redacted_dir, rel)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        redacted_text = _redact_sg_pii(original_text)
+        try:
+            with open(dest, 'w', encoding='utf-8') as fh:
+                fh.write(redacted_text)
+            cleaned.append(dest)
+        except OSError:
+            # If we cannot write the redacted copy, skip the file entirely
+            logger.warning('Could not write redacted copy of %s — file excluded from scan', fpath)
+
+    return cleaned
+
 
 # ===========================================================================
 # CLI
