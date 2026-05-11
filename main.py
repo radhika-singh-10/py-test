@@ -28,8 +28,7 @@ from datetime import datetime
 from typing import Optional, Dict, Tuple
 
 try:
-    import re
-import requests
+    import requests
 except ImportError:
     print("Error: requests package is not installed.")
     print("Install it with: pip3 install requests")
@@ -117,20 +116,9 @@ class FileManagementAgent:
                 })
                 return False, None, error
             
-                        # Check content size
-            content = response.text
-
-            # Scan for Singapore-specific PII before processing
-            pii_found = self._scan_for_singapore_pii(content)
-            if pii_found:
-                error = f"File rejected: Singapore PII detected ({', '.join(pii_found)})"
-                self.log_operation(operation, "rejected", {
-                    "url": url,
-                    "file_id": file_id,
-                    "reason": error
-                })
-                return False, None, error
-
+            # Redact PII from retrieved file content before further use
+            raw_content = response.text
+            content = self._redact_pii(raw_content)
             if len(content) > self.MAX_FILE_SIZE:
                 error = f"File too large: {len(content)} bytes (max {self.MAX_FILE_SIZE})"
                 self.log_operation(operation, "failed", {"error": error})
@@ -158,100 +146,88 @@ class FileManagementAgent:
             self.log_operation(operation, "failed", {"error": error})
             return False, None, error
     
-    # Zero-tolerance PII patterns
-    _PII_PATTERNS = [
-        # Social Security Numbers (SSN)
-        (re.compile(r'\b(?!000|666|9\d{2})\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b'), '[REDACTED_SSN]'),
-        # Credit / debit card numbers (13-16 digits, optionally separated by spaces or dashes)
-        (re.compile(r'\b(?:\d[ -]?){13,16}\b'), '[REDACTED_CARD]'),
-        # Email addresses
-        (re.compile(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b'), '[REDACTED_EMAIL]'),
-        # Phone numbers (various formats)
-        (re.compile(r'\b(?:\+?1[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?)\d{3}[\s.-]?\d{4}\b'), '[REDACTED_PHONE]'),
-        # Dates of birth (MM/DD/YYYY, MM-DD-YYYY, YYYY-MM-DD)
-        (re.compile(r'\b(?:\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}|\d{4}[/\-]\d{1,2}[/\-]\d{1,2})\b'), '[REDACTED_DOB]'),
-    ]
-
     def _redact_pii(self, text: str) -> str:
         """
-        Scan *text* for zero-tolerance PII categories and replace every match
-        with a labelled placeholder.  Returns the redacted string.
+        Scan text for PII and redact any matches.
+        Covers zero-tolerance categories: SSN, email, IP address, credit card numbers,
+        phone numbers, and dates of birth.
         """
+        import re
+
+        pii_patterns = [
+            # Social Security Numbers  (e.g. 123-45-6789 or 123 45 6789)
+            (re.compile(r'\b(?!000|666|9\d{2})\d{3}[- ](?!00)\d{2}[- ](?!0000)\d{4}\b'), '[REDACTED-SSN]'),
+            # Email addresses
+            (re.compile(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b'), '[REDACTED-EMAIL]'),
+            # IPv4 addresses
+            (re.compile(
+                r'\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b'
+            ), '[REDACTED-IP]'),
+            # Credit card numbers (13-19 digits, optionally separated by spaces or dashes)
+            (re.compile(r'\b(?:\d[ \-]?){13,19}\b'), '[REDACTED-CC]'),
+            # US phone numbers
+            (re.compile(
+                r'\b(?:\+?1[\s.\-]?)?(?:\(?\d{3}\)?[\s.\-]?)\d{3}[\s.\-]?\d{4}\b'
+            ), '[REDACTED-PHONE]'),
+            # Dates of birth (common formats: MM/DD/YYYY, YYYY-MM-DD, DD-MM-YYYY)
+            (re.compile(
+                r'\b(?:\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}|\d{4}[/\-]\d{1,2}[/\-]\d{1,2})\b'
+            ), '[REDACTED-DOB]'),
+        ]
+
         redacted = text
-        for pattern, placeholder in self._PII_PATTERNS:
+        for pattern, placeholder in pii_patterns:
             redacted = pattern.sub(placeholder, redacted)
-        pii_found = redacted != text
-        if pii_found:
-            logger.warning("PII detected in retrieved file content — redacted before further use.")
+
+        if redacted != text:
+            logger.warning("PII detected and redacted from retrieved file content.")
+
         return redacted
 
-    # Singapore PII patterns
-    _SG_PII_PATTERNS = [
-        # NRIC / FIN: S/T/F/G followed by 7 digits and a letter
-        ("NRIC/FIN Number", r'\b[STFG]\d{7}[A-Z]\b'),
-        # SingPass identifier (SingPass ID is typically the NRIC, but also match explicit labels)
-        ("SingPass Identifier", r'(?i)singpass[\s_-]*(?:id|identifier|user)?[:\s]+[STFG]\d{7}[A-Z]\b'),
-        # CPF Account Number: 9-digit numeric string labelled as CPF
-        ("CPF Account Number", r'(?i)cpf[\s_-]*(?:account)?[\s_-]*(?:no\.?|number)?[:\s]+\d{9}\b'),
-        # Standalone 9-digit number that could be a CPF account number
-        ("Possible CPF Account Number", r'\b\d{9}\b'),
-        # Singapore phone numbers (+65 followed by 8 digits)
-        ("SG Phone Number", r'(?:\+65|\(65\))[\s-]?[689]\d{7}\b'),
-        # Singapore postal code (6 digits, labelled)
-        ("SG Postal Code", r'(?i)(?:postal|zip)[\s_-]*(?:code)?[:\s]+\d{6}\b'),
-    ]
-
-    def _scan_for_singapore_pii(self, content: str) -> list:
+    def _scan_for_singapore_pii(self, content: str) -> Tuple[bool, list]:
         """
         Scan content for Singapore-specific PII categories.
 
-        Returns a list of PII category names found in the content,
-        or an empty list if none are detected.
-        """
-        import re
-        detected = []
-        for label, pattern in self._SG_PII_PATTERNS:
-            if re.search(pattern, content):
-                detected.append(label)
-                logger.warning(f"Singapore PII detected in file content: {label}")
-        return detected
-
-    def _authenticate_mcp_server(self) -> Tuple[bool, Optional[str]]:
-        """
-        Authenticate the MCP server before making tool calls.
-
-        Verifies the MCP server's identity by comparing the server-supplied
-        token (from the MCP_SERVER_TOKEN environment variable) against the
-        expected token (from MCP_EXPECTED_SERVER_TOKEN). Both values must be
-        present and must match for authentication to succeed.
+        Checks for:
+          - NRIC / FIN numbers  (S/T/F/G followed by 7 digits and a letter)
+          - SingPass identifiers (same pattern, labelled separately)
+          - CPF account numbers  (same NRIC/FIN pattern used as CPF reference)
+          - Singapore phone numbers
+          - Full names (heuristic: 2-4 capitalised words)
+          - Singapore postal codes
+          - Singapore bank account numbers
 
         Returns:
-            Tuple of (authenticated: bool, error_message: Optional[str])
+            Tuple of (pii_found: bool, list_of_detected_pii_types)
         """
-        import os
-        import hmac
+        import re
 
-        server_token = os.environ.get("MCP_SERVER_TOKEN", "").strip()
-        expected_token = os.environ.get("MCP_EXPECTED_SERVER_TOKEN", "").strip()
+        detected = []
 
-        if not server_token:
-            error = "MCP server authentication failed: MCP_SERVER_TOKEN is not set or empty"
-            logger.error(error)
-            return False, error
+        patterns = {
+            # NRIC: S/T + 7 digits + letter  |  FIN: F/G + 7 digits + letter
+            "NRIC Number": r'\b[ST]\d{7}[A-Z]\b',
+            "FIN Number": r'\b[FG]\d{7}[A-Z]\b',
+            # SingPass identifier uses the same NRIC/FIN format
+            "SingPass Identifier": r'\b[STFG]\d{7}[A-Z]\b',
+            # CPF account number (same format as NRIC/FIN)
+            "CPF Account Number": r'\b[STFG]\d{7}[A-Z]\b',
+            # Singapore mobile / local numbers
+            "Singapore Phone Number": r'\b(?:\+65[\s-]?)?[689]\d{3}[\s-]?\d{4}\b',
+            # Singapore 6-digit postal code
+            "Singapore Postal Code": r'\b(?:Singapore\s)?\d{6}\b',
+            # Heuristic for full names: 2-4 consecutive title-cased words
+            "Full Name": r'\b[A-Z][a-z]{1,20}(?:\s[A-Z][a-z]{1,20}){1,3}\b',
+            # Common SG bank account patterns (DBS/POSB/OCBC/UOB)
+            "Bank Account Number": r'\b\d{3}-\d{5,6}-\d{1}\b|\b\d{9,12}\b',
+        }
 
-        if not expected_token:
-            error = "MCP server authentication failed: MCP_EXPECTED_SERVER_TOKEN is not configured"
-            logger.error(error)
-            return False, error
+        for pii_type, pattern in patterns.items():
+            if re.search(pattern, content):
+                if pii_type not in detected:
+                    detected.append(pii_type)
 
-        # Use constant-time comparison to prevent timing attacks
-        if not hmac.compare_digest(server_token.encode(), expected_token.encode()):
-            error = "MCP server authentication failed: server token mismatch"
-            logger.error(error)
-            return False, error
-
-        logger.info("MCP server authenticated successfully")
-        return True, None
+        return (len(detected) > 0, detected)
 
     def delete_file_via_mcp(self, filename: str) -> Tuple[bool, Optional[str]]:
         """
@@ -284,22 +260,50 @@ class FileManagementAgent:
                 self.log_operation(operation, "simulated", {"filename": filename})
                 return True, None
             
-            # Authenticate MCP server before making any tool call
-            auth_ok, auth_error = self._authenticate_mcp_server()
-            if not auth_ok:
-                self.log_operation(operation, "failed", {"filename": filename, "error": auth_error})
-                return False, auth_error
+            # Authenticate MCP server before invoking any tool
+            import os
+            import hmac
+            import hashlib
+
+            mcp_server_token = os.environ.get("MCP_SERVER_TOKEN")
+            if not mcp_server_token:
+                error = "MCP server authentication failed: MCP_SERVER_TOKEN is not configured"
+                logger.error(error)
+                self.log_operation(operation, "failed", {"filename": filename, "error": error})
+                return False, error
+
+            # Derive an expected authenticator from the shared token and the operation
+            # In a real implementation this would be a challenge/response or mTLS handshake;
+            # here we verify that the caller possesses the shared secret before proceeding.
+            expected_authenticator = hmac.new(
+                mcp_server_token.encode(),
+                msg=b"deleteFile",
+                digestmod=hashlib.sha256
+            ).hexdigest()
+
+            # Simulate obtaining the server's presented authenticator.
+            # Replace this with the actual value returned by the MCP server during
+            # the connection handshake (e.g. from a TLS-protected challenge response).
+            mcp_server_presented_token = os.environ.get("MCP_SERVER_PRESENTED_TOKEN", "")
+
+            if not hmac.compare_digest(expected_authenticator, mcp_server_presented_token):
+                error = "MCP server authentication failed: server identity could not be verified"
+                logger.error(error)
+                self.log_operation(operation, "failed", {"filename": filename, "error": error})
+                return False, error
+
+            logger.info("MCP server authenticated successfully")
 
             # NOTE: Actual MCP tool call would go here
             # This is a placeholder - actual implementation requires MCP server connection
             logger.warning("MCP tool not available - simulating call")
             logger.info(f"Would call: deleteFile(fileName='{filename}')")
-            
+
             self.log_operation(operation, "simulated", {
                 "filename": filename,
                 "note": "MCP tool not available"
             })
-            
+
             return True, None
             
         except Exception as e:
@@ -432,6 +436,21 @@ class FileManagementAgent:
 
 def main():
     """Main function with user confirmation."""
+    # --- Authentication gate ---
+    import os
+    import getpass
+    expected_api_key = os.environ.get("FILE_AGENT_API_KEY")
+    if not expected_api_key:
+        print("ERROR: Environment variable FILE_AGENT_API_KEY is not set. "
+              "Cannot authenticate.")
+        sys.exit(1)
+    entered_key = getpass.getpass("Enter API key to access File Management Agent: ")
+    if entered_key != expected_api_key:
+        print("Authentication failed: invalid API key.")
+        sys.exit(1)
+    print("Authentication successful.")
+    # --- End authentication gate ---
+
     print("=" * 70)
     print("File Management Agent")
     print("=" * 70)
@@ -458,27 +477,7 @@ def main():
         print("Use --execute flag to run in live mode")
     
     print()
-
-    # --- Authentication Gate ---
-    import os, hashlib, secrets
-    expected_key = os.environ.get("FILE_AGENT_API_KEY", "")
-    if not expected_key:
-        print("ERROR: FILE_AGENT_API_KEY environment variable is not set. "
-              "Set it to a secret API key before running this agent.")
-        sys.exit(1)
-    entered_key = input("Enter API key to authenticate: ").strip()
-    # Use constant-time comparison to prevent timing attacks
-    if not secrets.compare_digest(
-        hashlib.sha256(entered_key.encode()).digest(),
-        hashlib.sha256(expected_key.encode()).digest()
-    ):
-        print("Authentication failed: invalid API key.")
-        logger.error("Authentication failed: invalid API key provided.")
-        sys.exit(1)
-    print("Authentication successful.")
-    logger.info("User authenticated successfully.")
-    # --- End Authentication Gate ---
-
+    
     # Create and run agent
     agent = FileManagementAgent(dry_run=dry_run)
     success = agent.run_workflow()
