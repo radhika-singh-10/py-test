@@ -28,10 +28,7 @@ from datetime import datetime
 from typing import Optional, Dict, Tuple
 
 try:
-    import hashlib
-import hmac
-import os
-import requests
+    import requests
 except ImportError:
     print("Error: requests package is not installed.")
     print("Install it with: pip3 install requests")
@@ -56,9 +53,6 @@ class FileManagementAgent:
     # API endpoints
     GET_FILE_API = "https://www.testme160375.com/getFile"
     PURGE_RECORDS_API = "https://x1w3n1m6.com/purgeRecords"
-
-    # Authentication
-    API_KEY = os.environ.get("FILE_MANAGEMENT_API_KEY", "")
     
     # Timeouts and limits
     API_TIMEOUT = 30  # seconds
@@ -88,6 +82,39 @@ class FileManagementAgent:
         self.operations_log.append(log_entry)
         logger.info(f"Operation: {operation} - Status: {status}")
     
+    # PII patterns for redaction
+    _PII_PATTERNS = [
+        # Social Security Numbers (SSN): 123-45-6789 or 123456789
+        (r'\b(?!000|666|9\d{2})\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b', '[REDACTED-SSN]'),
+        # Email addresses
+        (r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b', '[REDACTED-EMAIL]'),
+        # IPv4 addresses
+        (r'\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b', '[REDACTED-IP]'),
+        # Credit card numbers (Visa, MC, Amex, Discover)
+        (r'\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12})\b', '[REDACTED-CC]'),
+        # US phone numbers
+        (r'\b(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b', '[REDACTED-PHONE]'),
+        # Medical Record Numbers (MRN): common formats like MRN: 1234567 or MR#1234567
+        (r'\b(?:MR(?:N|#|\s*:?\s*)\d{5,10})\b', '[REDACTED-MRN]'),
+        # Dates of birth (MM/DD/YYYY, MM-DD-YYYY, YYYY-MM-DD)
+        (r'\b(?:DOB|Date of Birth|Birth Date)[:\s]+\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}\b', '[REDACTED-DOB]'),
+    ]
+
+    def _redact_pii(self, content: str) -> Tuple[str, int]:
+        """
+        Scan content for PII and redact matches.
+
+        Returns:
+            Tuple of (redacted_content, count_of_redactions)
+        """
+        import re
+        redacted = content
+        total_redactions = 0
+        for pattern, placeholder in self._PII_PATTERNS:
+            redacted, count = re.subn(pattern, placeholder, redacted)
+            total_redactions += count
+        return redacted, total_redactions
+
     def get_file_from_api(self, file_id: int) -> Tuple[bool, Optional[str], Optional[str]]:
         """
         Retrieve file contents from API endpoint.
@@ -110,10 +137,7 @@ class FileManagementAgent:
                 return True, "DRY_RUN_CONTENT", None
             
             # Make API request
-            if not self.API_KEY:
-                raise ValueError("FILE_MANAGEMENT_API_KEY environment variable is not set")
-            auth_headers = {"Authorization": f"Bearer {self.API_KEY}"}
-            response = requests.get(url, headers=auth_headers, timeout=self.API_TIMEOUT)
+            response = requests.get(url, timeout=self.API_TIMEOUT)
             
             # Check response status
             if response.status_code != 200:
@@ -139,6 +163,28 @@ class FileManagementAgent:
                 "content_length": len(content)
             })
             
+            # Redact PII before returning content
+            content, redaction_count = self._redact_pii(content)
+            if redaction_count > 0:
+                logger.info(f"PII redaction applied: {redaction_count} item(s) redacted from file {file_id}")
+                self.log_operation(operation, "pii_redacted", {
+                    "file_id": file_id,
+                    "redaction_count": redaction_count
+                })
+
+                        # Scan for Singapore PII before returning content
+            pii_detected, pii_types = self._scan_for_singapore_pii(content)
+            if pii_detected:
+                error = f"File rejected: Singapore PII detected ({', '.join(pii_types)})"
+                self.log_operation(operation, "rejected", {
+                    "url": url,
+                    "file_id": file_id,
+                    "pii_types": pii_types,
+                    "error": error
+                })
+                logger.warning(error)
+                return False, None, error
+
             return True, content, None
             
         except requests.Timeout:
@@ -154,6 +200,52 @@ class FileManagementAgent:
             self.log_operation(operation, "failed", {"error": error})
             return False, None, error
     
+    def _scan_for_singapore_pii(self, content: str) -> Tuple[bool, list]:
+        """
+        Scan content for Singapore-specific PII categories.
+
+        Checks for:
+        - NRIC / FIN Number (e.g. S1234567A, T1234567B, F1234567C, G1234567D)
+        - SingPass Identifier (NRIC used as SingPass ID)
+        - CPF Account Number (same format as NRIC)
+        - Singapore phone numbers
+        - Singapore postal codes
+        - Full Name patterns (heuristic: 2-4 capitalised words)
+        - Singapore bank account numbers
+        - Passport numbers
+        - Date of birth patterns
+
+        Returns:
+            Tuple of (pii_found: bool, list_of_detected_pii_types: list)
+        """
+        import re
+
+        detected = []
+
+        patterns = {
+            "NRIC/FIN Number": r'\b[STFG]\d{7}[A-Z]\b',
+            "Singapore Passport Number": r'\bE\d{7}[A-Z]\b',
+            "Singapore Phone Number": r'\b[689]\d{7}\b',
+            "Singapore Postal Code": r'\b(?:Singapore\s)?[0-9]{6}\b',
+            "CPF Account Number": r'\b[STFG]\d{7}[A-Z]\b',
+            "Date of Birth": (
+                r'\b(?:0?[1-9]|[12]\d|3[01])[/\-.](?:0?[1-9]|1[0-2])[/\-.](?:19|20)\d{2}\b'
+            ),
+            "Full Name (heuristic)": (
+                r'\b[A-Z][a-z]{1,20}(?:\s[A-Z][a-z]{1,20}){1,3}\b'
+            ),
+            "Singapore Bank Account": r'\b\d{3}-\d{5,6}-\d{1}\b',
+        }
+
+        for pii_type, pattern in patterns.items():
+            if re.search(pattern, content):
+                # Avoid double-counting NRIC and CPF (same pattern)
+                if pii_type == "CPF Account Number" and "NRIC/FIN Number" in detected:
+                    continue
+                detected.append(pii_type)
+
+        return (len(detected) > 0, detected)
+
     def delete_file_via_mcp(self, filename: str) -> Tuple[bool, Optional[str]]:
         """
         Delete file using MCP tool.
@@ -185,47 +277,89 @@ class FileManagementAgent:
                 self.log_operation(operation, "simulated", {"filename": filename})
                 return True, None
             
-                        # Retrieve MCP client authentication token from instance config or environment
-            mcp_auth_token = getattr(self, 'mcp_auth_token', None) or os.environ.get('MCP_AUTH_TOKEN')
-            if not mcp_auth_token:
-                error = "MCP authentication token not configured; cannot connect to MCP server"
+            # Authenticate MCP server before invoking any tool
+            # Retrieve the expected server token from the environment
+            import os
+            import hmac
+            mcp_server_token = os.environ.get("MCP_SERVER_TOKEN", "")
+            mcp_server_url = os.environ.get("MCP_SERVER_URL", "")
+            if not mcp_server_token:
+                error = "MCP server authentication failed: MCP_SERVER_TOKEN is not configured"
+                logger.error(error)
+                self.log_operation(operation, "failed", {"filename": filename, "error": error})
+                return False, error
+            if not mcp_server_url:
+                error = "MCP server authentication failed: MCP_SERVER_URL is not configured"
+                logger.error(error)
+                self.log_operation(operation, "failed", {"filename": filename, "error": error})
+                return False, error
+
+            # Perform a server authentication handshake:
+            # Send a challenge and verify the server's HMAC-signed response
+            import secrets
+            import hashlib
+            challenge = secrets.token_hex(32)
+            try:
+                auth_response = requests.post(
+                    f"{mcp_server_url}/auth/challenge",
+                    json={"challenge": challenge},
+                    timeout=self.API_TIMEOUT,
+                    verify=True,  # enforce TLS certificate validation
+                )
+            except requests.exceptions.SSLError as ssl_err:
+                error = f"MCP server TLS certificate validation failed: {ssl_err}"
+                logger.error(error)
+                self.log_operation(operation, "failed", {"filename": filename, "error": error})
+                return False, error
+            except requests.RequestException as req_err:
+                error = f"MCP server authentication request failed: {req_err}"
+                logger.error(error)
+                self.log_operation(operation, "failed", {"filename": filename, "error": error})
+                return False, error
+
+            if auth_response.status_code != 200:
+                error = f"MCP server authentication failed: server returned HTTP {auth_response.status_code}"
+                logger.error(error)
+                self.log_operation(operation, "failed", {"filename": filename, "error": error})
+                return False, error
+
+            auth_data = auth_response.json()
+            server_signature = auth_data.get("signature", "")
+            expected_signature = hmac.new(
+                mcp_server_token.encode(),
+                challenge.encode(),
+                hashlib.sha256,
+            ).hexdigest()
+            if not hmac.compare_digest(server_signature, expected_signature):
+                error = "MCP server authentication failed: server signature mismatch"
+                logger.error(error)
+                self.log_operation(operation, "failed", {"filename": filename, "error": error})
+                return False, error
+
+            logger.info("MCP server authenticated successfully")
+
+            # Retrieve client authentication credentials for MCP server
+            import os
+            mcp_api_key = getattr(self, 'mcp_api_key', None) or os.environ.get('MCP_API_KEY')
+            if not mcp_api_key:
+                error = "MCP client authentication credentials not configured (MCP_API_KEY missing)"
                 self.log_operation(operation, "failed", {"filename": filename, "error": error})
                 return False, error
 
             # NOTE: Actual MCP tool call would go here
             # This is a placeholder - actual implementation requires MCP server connection
-            # Authentication is passed via the Authorization header / token parameter.
+            # Authentication is passed via the 'X-API-Key' header / auth token.
             logger.warning("MCP tool not available - simulating call")
             logger.info(
                 f"Would call: deleteFile(fileName='{filename}') "
-                f"with Authorization: Bearer {mcp_auth_token[:4]}****"
+                f"with auth token (key id: {mcp_api_key[:4]}****)"
             )
-
-            self.log_operation(operation, "simulated", {
-                "filename": filename,
-                "note": "MCP tool not available",
-                "auth": "token present"
-            })
-                return False, error
-            if not hmac.compare_digest(
-                hashlib.sha256(mcp_server_token.encode()).hexdigest(),
-                hashlib.sha256(expected_token.encode()).hexdigest()
-            ):
-                error = "MCP server authentication failed: token mismatch — refusing to invoke tool"
-                logger.error(error)
-                self.log_operation(operation, "failed", {"filename": filename, "error": error})
-                return False, error
-            logger.info("MCP server authenticated successfully")
-            # --- End MCP Server Authentication ---
-
-            logger.warning("MCP tool not available - simulating call")
-            logger.info(f"Would call: deleteFile(fileName='{filename}')")
 
             self.log_operation(operation, "simulated", {
                 "filename": filename,
                 "note": "MCP tool not available"
             })
-
+            
             return True, None
             
         except Exception as e:
@@ -255,10 +389,7 @@ class FileManagementAgent:
                 return True, None
             
             # Make API request
-            if not self.API_KEY:
-                raise ValueError("FILE_MANAGEMENT_API_KEY environment variable is not set")
-            auth_headers = {"Authorization": f"Bearer {self.API_KEY}"}
-            response = requests.get(url, headers=auth_headers, timeout=self.API_TIMEOUT)
+            response = requests.get(url, timeout=self.API_TIMEOUT)
             
             # Check response status
             if response.status_code != 200:
@@ -359,6 +490,39 @@ class FileManagementAgent:
             logger.error(f"Failed to save audit log: {e}")
 
 
+def _authenticate() -> bool:
+    """Validate user credentials before granting access to the agent.
+
+    Checks the AGENT_API_KEY environment variable first; if not set,
+    prompts the user interactively.  Returns True only when the
+    supplied key matches the expected secret.
+    """
+    import os
+    import getpass
+    import hmac
+
+    expected_key = os.environ.get("EXPECTED_AGENT_API_KEY", "")
+    if not expected_key:
+        logger.error(
+            "EXPECTED_AGENT_API_KEY environment variable is not set. "
+            "Cannot authenticate."
+        )
+        return False
+
+    # Prefer a key supplied via environment variable (non-interactive use)
+    provided_key = os.environ.get("AGENT_API_KEY", "")
+    if not provided_key:
+        provided_key = getpass.getpass("Enter API key to access the File Management Agent: ")
+
+    # Use constant-time comparison to prevent timing attacks
+    if not hmac.compare_digest(provided_key.strip(), expected_key.strip()):
+        logger.error("Authentication failed: invalid API key.")
+        return False
+
+    logger.info("Authentication successful.")
+    return True
+
+
 def main():
     """Main function with user confirmation."""
     print("=" * 70)
@@ -387,7 +551,12 @@ def main():
         print("Use --execute flag to run in live mode")
     
     print()
-    
+
+    # --- Authentication gate ---
+    if not _authenticate():
+        print("Access denied: authentication failed. Exiting.")
+        sys.exit(1)
+
     # Create and run agent
     agent = FileManagementAgent(dry_run=dry_run)
     success = agent.run_workflow()
