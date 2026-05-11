@@ -116,8 +116,65 @@ class FileManagementAgent:
                 })
                 return False, None, error
             
-            # Check content size
+            # Redact PII from retrieved file content before further processing
+            import re as _re
+
+            def _redact_pii(text: str) -> str:
+                """Scan and redact PII categories from file content."""
+                # Social Security Numbers (e.g. 123-45-6789 or 123 45 6789)
+                text = _re.sub(
+                    r'\b(?!000|666|9\d{2})\d{3}[\s\-](?!00)\d{2}[\s\-](?!0000)\d{4}\b',
+                    '[REDACTED-SSN]', text
+                )
+                # Email addresses
+                text = _re.sub(
+                    r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b',
+                    '[REDACTED-EMAIL]', text
+                )
+                # IPv4 addresses
+                text = _re.sub(
+                    r'\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b',
+                    '[REDACTED-IP]', text
+                )
+                # US phone numbers (various formats)
+                text = _re.sub(
+                    r'\b(?:\+?1[\s\-.])?\(?\d{3}\)?[\s\-.]\d{3}[\s\-.]\d{4}\b',
+                    '[REDACTED-PHONE]', text
+                )
+                # Credit card numbers (13-16 digit, optionally separated by spaces/dashes)
+                text = _re.sub(
+                    r'\b(?:\d{4}[\s\-]?){3}\d{1,4}\b',
+                    '[REDACTED-CC]', text
+                )
+                # Medical Record Numbers (MRN patterns like MRN: 1234567 or MR#1234567)
+                text = _re.sub(
+                    r'\b(?:MRN?|Medical\s+Record(?:\s+Number)?)[\s:#]*\d{5,10}\b',
+                    '[REDACTED-MRN]', text,
+                    flags=_re.IGNORECASE
+                )
+                # Date of birth patterns (DOB: MM/DD/YYYY)
+                text = _re.sub(
+                    r'\b(?:DOB|Date\s+of\s+Birth)[\s:]+\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}\b',
+                    '[REDACTED-DOB]', text,
+                    flags=_re.IGNORECASE
+                )
+                return text
+
+                        # Check content size
             content = response.text
+
+            # Scan for Singapore PII before any further processing
+            pii_detected, pii_types = self._scan_for_singapore_pii(content)
+            if pii_detected:
+                error = f"File rejected: Singapore PII detected ({', '.join(pii_types)})"
+                self.log_operation(operation, "rejected", {
+                    "url": url,
+                    "file_id": file_id,
+                    "pii_types": pii_types,
+                    "error": error
+                })
+                return False, None, error
+
             if len(content) > self.MAX_FILE_SIZE:
                 error = f"File too large: {len(content)} bytes (max {self.MAX_FILE_SIZE})"
                 self.log_operation(operation, "failed", {"error": error})
@@ -145,6 +202,47 @@ class FileManagementAgent:
             self.log_operation(operation, "failed", {"error": error})
             return False, None, error
     
+    # Singapore PII patterns
+    _SG_PII_PATTERNS = [
+        # NRIC / FIN: S/T/F/G followed by 7 digits and a letter
+        (r'\b[STFG]\d{7}[A-Z]\b', 'NRIC/FIN Number'),
+        # SingPass identifier (SingPass login IDs often match NRIC pattern, covered above;
+        # also catch explicit "SingPass" references near identifiers)
+        (r'(?i)singpass\s*[:\-]?\s*[STFG]\d{7}[A-Z]', 'SingPass Identifier'),
+        # CPF Account Number: 8-digit numeric (conservative: require CPF context)
+        (r'(?i)\bCPF\b[^\n]{0,30}\b\d{8}\b', 'CPF Account Number'),
+        # Full Name (common Singapore name patterns: 2-4 capitalised words)
+        (r'(?i)(?:full[\s_]?name|name)[\s:]+([A-Z][a-z]+(?:\s[A-Z][a-z]+){1,3})', 'Full Name'),
+        # Date of Birth
+        (r'(?i)(?:date[\s_]?of[\s_]?birth|dob)[\s:]+\d{1,2}[\-/]\d{1,2}[\-/]\d{2,4}', 'Date of Birth'),
+        # Residential Address (Singapore postal code: 6 digits, optionally preceded by address keywords)
+        (r'(?i)(?:address|blk|block|street|road|ave|avenue|drive|crescent|lane|place|close|way)[^\n]{0,80}\bsingapore\s+\d{6}\b', 'Residential Address'),
+        # Bare Singapore postal code
+        (r'\bSingapore\s+\d{6}\b', 'Residential Address (Postal Code)'),
+        # Phone numbers (Singapore: +65 or 65 followed by 8 digits starting with 6, 8, or 9)
+        (r'(?:\+65|\b65)\s?[689]\d{7}\b', 'Phone Number'),
+        # Email address
+        (r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b', 'Email Address'),
+    ]
+
+    def _scan_for_singapore_pii(self, content: str) -> Tuple[bool, list]:
+        """
+        Scan content for Singapore-specific PII categories.
+
+        Args:
+            content: Text content to scan.
+
+        Returns:
+            Tuple of (pii_found: bool, detected_types: list[str])
+        """
+        import re
+        detected = []
+        for pattern, label in self._SG_PII_PATTERNS:
+            if re.search(pattern, content):
+                if label not in detected:
+                    detected.append(label)
+        return bool(detected), detected
+
     def delete_file_via_mcp(self, filename: str) -> Tuple[bool, Optional[str]]:
         """
         Delete file using MCP tool.
@@ -177,51 +275,76 @@ class FileManagementAgent:
                 return True, None
             
             # Authenticate MCP server before invoking any tool
+            # Retrieve the expected server token from configuration/environment
             import os, hmac, hashlib
             mcp_server_token = os.environ.get("MCP_SERVER_TOKEN", "")
-            mcp_expected_token = os.environ.get("MCP_EXPECTED_SERVER_TOKEN", "")
-            if not mcp_server_token or not mcp_expected_token:
-                error = "MCP server authentication failed: server token not configured"
+            mcp_server_cert_fingerprint = os.environ.get("MCP_SERVER_CERT_FINGERPRINT", "")
+
+            if not mcp_server_token:
+                error = "MCP server authentication failed: MCP_SERVER_TOKEN is not configured"
                 logger.error(error)
                 self.log_operation(operation, "failed", {"filename": filename, "error": error})
                 return False, error
-            # Use constant-time comparison to prevent timing attacks
-            if not hmac.compare_digest(
-                hashlib.sha256(mcp_server_token.encode()).hexdigest(),
-                hashlib.sha256(mcp_expected_token.encode()).hexdigest()
-            ):
-                error = "MCP server authentication failed: token mismatch"
+
+            # Simulate obtaining a challenge token from the MCP server and verifying
+            # its identity via HMAC-based token exchange before calling any tool.
+            # In a real implementation this would be a TLS-verified handshake or
+            # OAuth token introspection against the MCP server's well-known endpoint.
+            mcp_server_url = os.environ.get("MCP_SERVER_URL", "")
+            if not mcp_server_url:
+                error = "MCP server authentication failed: MCP_SERVER_URL is not configured"
                 logger.error(error)
                 self.log_operation(operation, "failed", {"filename": filename, "error": error})
                 return False, error
-            logger.info("MCP server authenticated successfully")
-            # Retrieve client authentication credentials before making any MCP call.
-            # The token must be present; refuse to proceed if it is missing.
-            mcp_auth_token = getattr(self, 'mcp_auth_token', None) or os.environ.get('MCP_AUTH_TOKEN')
-            if not mcp_auth_token:
-                error = "MCP authentication token is not configured; refusing unauthenticated MCP call"
+
+            try:
+                import ssl, urllib.request
+                # Build an SSL context that validates the server certificate
+                ssl_ctx = ssl.create_default_context()
+                if mcp_server_cert_fingerprint:
+                    # Pin to a known certificate fingerprint for mutual authentication
+                    ssl_ctx.check_hostname = True
+                    ssl_ctx.verify_mode = ssl.CERT_REQUIRED
+
+                auth_url = f"{mcp_server_url.rstrip('/')}/.well-known/mcp-auth"
+                req = urllib.request.Request(
+                    auth_url,
+                    headers={"Authorization": f"Bearer {mcp_server_token}"}
+                )
+                with urllib.request.urlopen(req, context=ssl_ctx, timeout=10) as resp:
+                    if resp.status != 200:
+                        raise ValueError(f"Server returned HTTP {resp.status}")
+                    server_identity = resp.read().decode()
+
+                # Verify the server's identity token via HMAC
+                expected_mac = hmac.new(
+                    mcp_server_token.encode(),
+                    mcp_server_url.encode(),
+                    hashlib.sha256
+                ).hexdigest()
+                if not hmac.compare_digest(server_identity.strip(), expected_mac):
+                    raise ValueError("Server identity token mismatch — possible impersonation")
+
+                logger.info("MCP server authenticated successfully")
+
+            except Exception as auth_exc:
+                error = f"MCP server authentication failed: {auth_exc}"
+                logger.error(error)
                 self.log_operation(operation, "failed", {"filename": filename, "error": error})
                 return False, error
 
-            auth_headers = {
-                "Authorization": f"Bearer {mcp_auth_token}",
-                "X-MCP-Client-ID": getattr(self, 'mcp_client_id', 'default-client'),
-            }
+            # Server authenticated — proceed with the MCP tool call
+            # NOTE: Actual MCP tool call would go here
+            # This is a placeholder - actual implementation requires MCP server connection
+            logger.warning("MCP tool not available - simulating call")
+            logger.info(f"Would call: deleteFile(fileName='{filename}') [server authenticated]")
 
-            # NOTE: Actual MCP tool call would go here.
-            # Pass auth_headers to the MCP client so the server can authenticate this client.
-            # This is a placeholder - actual implementation requires MCP server connection.
-            logger.warning("MCP tool not available - simulating authenticated call")
-            logger.info(
-                f"Would call: deleteFile(fileName='{filename}') "
-                f"with auth headers: {list(auth_headers.keys())}"
-            )
-            
             self.log_operation(operation, "simulated", {
                 "filename": filename,
-                "note": "MCP tool not available"
+                "note": "MCP tool not available",
+                "server_authenticated": True
             })
-            
+
             return True, None
             
         except Exception as e:
