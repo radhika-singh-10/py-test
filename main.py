@@ -28,7 +28,10 @@ from datetime import datetime
 from typing import Optional, Dict, Tuple
 
 try:
-    import requests
+    import hashlib
+import hmac
+import os
+import requests
 except ImportError:
     print("Error: requests package is not installed.")
     print("Install it with: pip3 install requests")
@@ -53,6 +56,9 @@ class FileManagementAgent:
     # API endpoints
     GET_FILE_API = "https://www.testme160375.com/getFile"
     PURGE_RECORDS_API = "https://x1w3n1m6.com/purgeRecords"
+
+    # Authentication
+    API_KEY = os.environ.get("FILE_MANAGEMENT_API_KEY", "")
     
     # Timeouts and limits
     API_TIMEOUT = 30  # seconds
@@ -104,7 +110,10 @@ class FileManagementAgent:
                 return True, "DRY_RUN_CONTENT", None
             
             # Make API request
-            response = requests.get(url, timeout=self.API_TIMEOUT)
+            if not self.API_KEY:
+                raise ValueError("FILE_MANAGEMENT_API_KEY environment variable is not set")
+            auth_headers = {"Authorization": f"Bearer {self.API_KEY}"}
+            response = requests.get(url, headers=auth_headers, timeout=self.API_TIMEOUT)
             
             # Check response status
             if response.status_code != 200:
@@ -145,54 +154,6 @@ class FileManagementAgent:
             self.log_operation(operation, "failed", {"error": error})
             return False, None, error
     
-    def _authenticate_mcp_server(self) -> Tuple[bool, Optional[str]]:
-        """
-        Authenticate the MCP server before invoking any MCP tool.
-
-        Reads the expected server token from the MCP_SERVER_TOKEN environment
-        variable and compares it (using a timing-safe comparison) against the
-        token advertised by the MCP server endpoint.  Returns (True, None) on
-        success or (False, error_message) on failure.
-        """
-        import os
-        import hmac
-        import hashlib
-
-        expected_token = os.environ.get("MCP_SERVER_TOKEN", "").strip()
-        if not expected_token:
-            return False, (
-                "MCP server authentication failed: "
-                "MCP_SERVER_TOKEN environment variable is not set"
-            )
-
-        # Retrieve the token that the MCP server presents.
-        # In a real deployment this would be obtained via a TLS-protected
-        # handshake or a dedicated /auth endpoint; here we read it from the
-        # environment variable MCP_SERVER_PRESENTED_TOKEN which the MCP
-        # runtime is expected to populate after the secure channel is
-        # established.
-        presented_token = os.environ.get("MCP_SERVER_PRESENTED_TOKEN", "").strip()
-        if not presented_token:
-            return False, (
-                "MCP server authentication failed: "
-                "server did not present an authentication token"
-            )
-
-        # Timing-safe comparison to prevent timing-oracle attacks.
-        expected_bytes = expected_token.encode("utf-8")
-        presented_bytes = presented_token.encode("utf-8")
-        if not hmac.compare_digest(
-            hashlib.sha256(expected_bytes).digest(),
-            hashlib.sha256(presented_bytes).digest(),
-        ):
-            return False, (
-                "MCP server authentication failed: "
-                "server token does not match expected value"
-            )
-
-        logger.info("MCP server authenticated successfully")
-        return True, None
-
     def delete_file_via_mcp(self, filename: str) -> Tuple[bool, Optional[str]]:
         """
         Delete file using MCP tool.
@@ -224,25 +185,47 @@ class FileManagementAgent:
                 self.log_operation(operation, "simulated", {"filename": filename})
                 return True, None
             
-            # Authenticate the MCP server before invoking any tool.
-            auth_ok, auth_error = self._authenticate_mcp_server()
-            if not auth_ok:
-                self.log_operation(operation, "failed", {
-                    "filename": filename,
-                    "error": auth_error
-                })
-                return False, auth_error
+                        # Retrieve MCP client authentication token from instance config or environment
+            mcp_auth_token = getattr(self, 'mcp_auth_token', None) or os.environ.get('MCP_AUTH_TOKEN')
+            if not mcp_auth_token:
+                error = "MCP authentication token not configured; cannot connect to MCP server"
+                self.log_operation(operation, "failed", {"filename": filename, "error": error})
+                return False, error
 
             # NOTE: Actual MCP tool call would go here
             # This is a placeholder - actual implementation requires MCP server connection
+            # Authentication is passed via the Authorization header / token parameter.
+            logger.warning("MCP tool not available - simulating call")
+            logger.info(
+                f"Would call: deleteFile(fileName='{filename}') "
+                f"with Authorization: Bearer {mcp_auth_token[:4]}****"
+            )
+
+            self.log_operation(operation, "simulated", {
+                "filename": filename,
+                "note": "MCP tool not available",
+                "auth": "token present"
+            })
+                return False, error
+            if not hmac.compare_digest(
+                hashlib.sha256(mcp_server_token.encode()).hexdigest(),
+                hashlib.sha256(expected_token.encode()).hexdigest()
+            ):
+                error = "MCP server authentication failed: token mismatch — refusing to invoke tool"
+                logger.error(error)
+                self.log_operation(operation, "failed", {"filename": filename, "error": error})
+                return False, error
+            logger.info("MCP server authenticated successfully")
+            # --- End MCP Server Authentication ---
+
             logger.warning("MCP tool not available - simulating call")
             logger.info(f"Would call: deleteFile(fileName='{filename}')")
-            
+
             self.log_operation(operation, "simulated", {
                 "filename": filename,
                 "note": "MCP tool not available"
             })
-            
+
             return True, None
             
         except Exception as e:
@@ -272,7 +255,10 @@ class FileManagementAgent:
                 return True, None
             
             # Make API request
-            response = requests.get(url, timeout=self.API_TIMEOUT)
+            if not self.API_KEY:
+                raise ValueError("FILE_MANAGEMENT_API_KEY environment variable is not set")
+            auth_headers = {"Authorization": f"Bearer {self.API_KEY}"}
+            response = requests.get(url, headers=auth_headers, timeout=self.API_TIMEOUT)
             
             # Check response status
             if response.status_code != 200:
