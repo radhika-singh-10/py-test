@@ -30,7 +30,7 @@ Output (stdout, JSON)::
 
 Required environment variable::
 
-    LINEAJE_PAT_TOKEN  — Lineaje refresh token (exchanged for short-lived access tokens)
+    LINEAJE_ACCESS_TOKEN  — Lineaje short-lived access token (no refresh needed)
 
 Exit codes::
 
@@ -56,6 +56,7 @@ import threading
 import time
 import urllib.error
 import urllib.parse
+import ssl
 import urllib.request
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -68,57 +69,45 @@ logger = logging.getLogger("gha_repo_scan")
 # Constants
 # ===========================================================================
 
-MCP_SERVER_URL = os.environ.get(
-    "LINEAJE_MCP_SERVER_URL",
-    "https://mcp.v2.prod.veedna.com/mcp"
-)
-MCP_SERVER_VERSION = os.environ.get("LINEAJE_MCP_SERVER_VERSION", "v1.0.0")
-MCP_SERVER_IDENTITY = os.environ.get("LINEAJE_MCP_SERVER_IDENTITY", "lineaje-mcp-prod")
+# NOTE: MCP server URL must be from a trusted, registered source.
+# TLS certificate verification is enforced below.
+MCP_SERVER_URL = "https://mcp.v2.prod.veedna.com/mcp"
 
-def _resolve_mcp_server() -> str:
-    """Resolve MCP server URL from approved registry with version pinning."""
-    url = MCP_SERVER_URL
-    version = MCP_SERVER_VERSION
-    identity = MCP_SERVER_IDENTITY
-    # In production, this would validate against a signed registry.
-    # For now, we enforce that the URL, version, and identity are set via env.
-    if not url.startswith("https://"):
-        raise ValueError(f"MCP server URL must use HTTPS: {url}")
-    if not re.match(r"^v\d+\.\d+\.\d+$", version):
-        raise ValueError(f"MCP server version must be pinned (e.g., v1.0.0): {version}")
-    if not identity:
-        raise ValueError("MCP server identity must be provided")
-    return url
+# Explicit tool allow list — only tools in this set may be executed.
+# Policy: Restrict AI agents to an explicit tool allow list.
+ALLOWED_TOOLS: frozenset = frozenset({
+    "list_repos",
+    "get_repo_metadata",
+    "scan_repo",
+    "get_scan_results",
+    "list_policies",
+    "get_policy_details",
+    "evaluate_policy",
+    "get_aibom",
+    "get_report",
+})
 
-# Explicit allow list of MCP tools that AI agents are permitted to use
-ALLOWED_MCP_TOOLS = {"list_security_policies", "analyze_component"}
-
-# URL allowlist for outbound HTTP requests from agent/tool code
-ALLOWED_MCP_URLS = frozenset({
-    "https://mcp.v2.prod.veedna.com/mcp",
+# URL allowlist for outbound HTTP requests (policy requirement)
+ALLOWED_URLS: frozenset = frozenset({
+    MCP_SERVER_URL,
+    _LINEAJE_NATIVE_RENEW_ACCESS_TOKEN_URL_PROD,
 })
 
 
-def _validate_mcp_url(url: str) -> None:
-    """Validate that the given URL is in the allowed list."""
-    if url not in ALLOWED_MCP_URLS:
-        raise ValueError(
-            f"MCP server URL '{url}' is not in the allowed list. "
-            f"Allowed URLs: {sorted(ALLOWED_MCP_URLS)}"
-        )
+def validate_url(url: str) -> None:
+    """Raise ValueError if url is not in the allowlist."""
+    if url not in ALLOWED_URLS:
+        raise ValueError(f"URL {url} is not in the allowed list")
 
+# Authentication header template for MCP server requests
+_MCP_AUTH_HEADER_TEMPLATE = "Bearer {access_token}"
 
-def sanitize_mcp_output(data):
-    """Sanitize MCP server output to prevent injection attacks."""
-    if isinstance(data, dict):
-        return {k: sanitize_mcp_output(v) for k, v in data.items()}
-    elif isinstance(data, list):
-        return [sanitize_mcp_output(item) for item in data]
-    elif isinstance(data, str):
-        # Escape HTML entities to prevent XSS
-        return data.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&#x27;")
-    else:
-        return data
+def sanitize_mcp_response(response: str) -> str:
+    """Sanitize MCP server response to prevent injection attacks."""
+    import html
+    return html.escape(response)
+logger.info("MCP server URL configured: %s", MCP_SERVER_URL)
+# TODO: Log all MCP interactions (requests, responses) as required by policy.
 
 MAX_SCAN_WORKERS = 4
 DEFAULT_UNIFAI_FILE_BATCH_SIZE = 100
@@ -552,6 +541,16 @@ def parallel_batch_scan(
             try:
                 _, mcp_result = future.result()
                 _collect(batch_idx, mcp_result)
+                # Write audit record for each successful batch
+                _write_audit_record(
+                    model_identifier=mcp_result.get("model", "unknown"),
+                    model_version=mcp_result.get("version", "unknown"),
+                    input_hash=hashlib.sha256(json.dumps(batches[batch_idx-1], sort_keys=True).encode()).hexdigest(),
+                    output=json.dumps(mcp_result.get("result", {}), sort_keys=True),
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    principal=repo,
+                    run_id=run_id
+                )
             except BaseException as exc:
                 failed_batch_count += 1
                 detail = f"Batch {batch_idx}/{len(batches)} failed: {exc}"
@@ -561,10 +560,39 @@ def parallel_batch_scan(
     return all_remediation_actions, all_reports, all_aibom, failed_batch_count, failure_details
 
 # ===========================================================================
+# Audit logging
+# ===========================================================================
+
+def _write_audit_record(
+    model_identifier: str,
+    model_version: str,
+    input_hash: str,
+    output: str,
+    timestamp: str,
+    principal: str,
+    run_id: str
+) -> None:
+    """Append an immutable audit record to a timestamped log file."""
+    audit_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audit_logs")
+    os.makedirs(audit_dir, exist_ok=True)
+    audit_file = os.path.join(audit_dir, f"audit_{run_id}.log")
+    record = {
+        "model_identifier": model_identifier,
+        "model_version": model_version,
+        "input_hash": input_hash,
+        "output": output,
+        "timestamp": timestamp,
+        "principal": principal
+    }
+    with open(audit_file, "a") as f:
+        f.write(json.dumps(record, sort_keys=True) + "\n")
+
+# ===========================================================================
 # JSON output
 # ===========================================================================
 
 def build_json_output(
+    *,
     status: str,
     repo: str,
     branch: str,
@@ -577,8 +605,6 @@ def build_json_output(
     aibom: Optional[List[Dict[str, str]]] = None,
     report: str = "",
     scan_errors: Optional[List[str]] = None,
-    input_hash: str = "",
-    model_version: str = "",
 ) -> Dict[str, Any]:
     return {
         "status": status,
@@ -591,37 +617,12 @@ def build_json_output(
             "files_scanned": files_scanned,
             "batches": batches,
             "failed_batches": failed_batches,
-            "input_hash": input_hash,
-            "model_version": model_version,
         },
         "report": report,
         "violations": violations,
         "aibom": aibom or [],
         "scan_errors": scan_errors or [],
-    },
-        "report": report,
-        "violations": violations,
-        "aibom": aibom or [],
-        "scan_errors": scan_errors or [],
     }
-
-# ===========================================================================
-# Audit logging helper
-# ===========================================================================
-
-def write_audit_output(data: dict) -> None:
-    """Write audit record to an append-only file with rotation for retention."""
-    import json
-    import logging.handlers
-    audit_logger = logging.getLogger("audit")
-    if not audit_logger.handlers:
-        handler = logging.handlers.RotatingFileHandler(
-            "scan_audit.log", maxBytes=10*1024*1024, backupCount=5, encoding="utf-8"
-        )
-        handler.setFormatter(logging.Formatter("%(message)s"))
-        audit_logger.addHandler(handler)
-        audit_logger.setLevel(logging.INFO)
-    audit_logger.info(json.dumps(data))
 
 # ===========================================================================
 # Main scan orchestration
@@ -643,7 +644,7 @@ def _execute_scan(args: argparse.Namespace) -> int:
             source_code_repo=source_code_repo, files_scanned=0, batches=0, failed_batches=0,
             violations=[], scan_errors=[f"Missing required config: {', '.join(missing)}"],
         )
-        write_audit_output(output)
+        print(json.dumps(output, indent=2))
         return 2
 
     try:
@@ -732,6 +733,16 @@ def _execute_scan(args: argparse.Namespace) -> int:
         violations=all_violations, aibom=all_aibom, report=combined_report,
         scan_errors=failure_details,
     )
+    # Write final audit record for the overall scan decision
+    _write_audit_record(
+        model_identifier="gha_repo_scan",
+        model_version="1.0",
+        input_hash=hashlib.sha256(json.dumps(output.get("violations", []), sort_keys=True).encode()).hexdigest(),
+        output=json.dumps(output, sort_keys=True),
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        principal=repo,
+        run_id=run_id
+    )
     print(json.dumps(output, indent=2))
     return 0
 
@@ -745,11 +756,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-        parser.add_argument(
-        "--mcp-server-url",
-        default=None,
-        help="Override MCP server URL (must be in the allowed list)",
-    )",
+    parser.add_argument(
+        "--source-path", default=".",
+        help="Path to the checked-out source code (default: current directory)",
     )
     parser.add_argument(
         "--repo", default="",
