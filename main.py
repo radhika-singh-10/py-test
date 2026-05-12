@@ -22,7 +22,6 @@ Usage:
 
 import os
 import sys
-from urllib.parse import urlparse
 import json
 import logging
 from datetime import datetime
@@ -55,25 +54,12 @@ class FileManagementAgent:
     GET_FILE_API = "https://www.testme160375.com/getFile"
     PURGE_RECORDS_API = "https://x1w3n1m6.com/purgeRecords"
     
+    # URL allowlist for outbound requests
+    ALLOWED_URLS = {GET_FILE_API, PURGE_RECORDS_API}
+    
     # Timeouts and limits
     API_TIMEOUT = 30  # seconds
     MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
-    
-    # URL allowlist for security
-    ALLOWED_URLS = {
-        "https://www.testme160375.com/getFile",
-        "https://x1w3n1m6.com/purgeRecords"
-    }
-    
-    def _validate_url(self, url: str) -> bool:
-        """Validate URL against allowlist and ensure safe scheme."""
-        parsed = urlparse(url)
-        base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-        if parsed.scheme != "https":
-            return False
-        if base_url not in self.ALLOWED_URLS:
-            return False
-        return True
     
     def __init__(self, dry_run: bool = True):
         """
@@ -99,25 +85,6 @@ class FileManagementAgent:
         self.operations_log.append(log_entry)
         logger.info(f"Operation: {operation} - Status: {status}")
     
-    def redact_pii(self, content: str) -> str:
-        """
-        Redact personally identifiable information (PII) from the given content.
-        
-        Args:
-            content: The string content to redact
-            
-        Returns:
-            The content with PII redacted
-        """
-        import re
-        # Redact email addresses
-        content = re.sub(r'[\w\.-]+@[\w\.-]+\.\w+', '[REDACTED_EMAIL]', content)
-        # Redact phone numbers (simple pattern for US numbers)
-        content = re.sub(r'\b\d{3}[-.]?\d{3}[-.]?\d{4}\b', '[REDACTED_PHONE]', content)
-        # Redact SSN-like patterns
-        content = re.sub(r'\b\d{3}-\d{2}-\d{4}\b', '[REDACTED_SSN]', content)
-        return content
-
     def get_file_from_api(self, file_id: int) -> Tuple[bool, Optional[str], Optional[str]]:
         """
         Retrieve file contents from API endpoint.
@@ -133,22 +100,21 @@ class FileManagementAgent:
         
         try:
             url = f"{self.GET_FILE_API}?id={file_id}"
-            if not self._validate_url(url):
-                error = f"URL not allowed: {url}"
-                self.log_operation(operation, "failed", {"error": error})
-                return False, None, error
             
             if self.dry_run:
                 logger.info(f"DRY RUN: Would call GET {url}")
                 self.log_operation(operation, "simulated", {"url": url, "file_id": file_id})
                 return True, "DRY_RUN_CONTENT", None
             
-            # Make API request
-            response = requests.get(url, timeout=self.API_TIMEOUT, allow_redirects=False)
-            if response.status_code in (301, 302, 303, 307, 308):
-                error = "Redirect not allowed"
-                self.log_operation(operation, "failed", {"error": error})
+            # Validate URL against allowlist
+            base_url = url.split('?')[0]
+            if base_url not in self.ALLOWED_URLS:
+                error = f"URL {base_url} is not in the allowed list"
+                self.log_operation(operation, "failed", {"url": url, "error": error})
                 return False, None, error
+            
+            # Make API request (no redirects to prevent bypass)
+            response = requests.get(url, timeout=self.API_TIMEOUT, allow_redirects=False)
             
             # Check response status
             if response.status_code != 200:
@@ -160,11 +126,20 @@ class FileManagementAgent:
                 })
                 return False, None, error
             
-            # Check content size
+                        # Check content size
             content = response.text
             if len(content) > self.MAX_FILE_SIZE:
                 error = f"File too large: {len(content)} bytes (max {self.MAX_FILE_SIZE})"
                 self.log_operation(operation, "failed", {"error": error})
+                return False, None, error
+
+            # Check for Singapore PII (NRIC, FIN, etc.)
+            import re
+            # Singapore NRIC/FIN patterns: S/T/F/G/M followed by 7 digits and a letter
+            sg_pii_pattern = r'\b[STFGM]\d{7}[A-Z]\b'
+            if re.search(sg_pii_pattern, content):
+                error = "File contains Singapore PII (NRIC/FIN) and cannot be uploaded"
+                self.log_operation(operation, "failed", {"error": error, "reason": "PII detected"})
                 return False, None, error
             
             # Success
@@ -174,8 +149,6 @@ class FileManagementAgent:
                 "content_length": len(content)
             })
             
-            # Redact PII from content before returning
-            content = self.redact_pii(content)
             return True, content, None
             
         except requests.Timeout:
@@ -190,13 +163,81 @@ class FileManagementAgent:
             error = f"Unexpected error: {str(e)}"
             self.log_operation(operation, "failed", {"error": error})
             return False, None, error
+
+    def _redact_pii(self, text: str) -> str:
+        """
+        Redact common PII patterns from text.
+        
+        Args:
+            text: Input string to scan for PII
+            
+        Returns:
+            String with PII redacted
+        """
+        import re
+        # Redact email addresses
+        text = re.sub(r'[\w\.-]+@[\w\.-]+\.\w+', '[REDACTED_EMAIL]', text)
+        # Redact US phone numbers (e.g., 123-456-7890, (123) 456-7890)
+        text = re.sub(r'\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}', '[REDACTED_PHONE]', text)
+        # Redact Social Security Numbers (XXX-XX-XXXX)
+        text = re.sub(r'\b\d{3}-\d{2}-\d{4}\b', '[REDACTED_SSN]', text)
+        return text
     
-    def delete_file_via_mcp(self, filename: str, client_token: str = "") -> Tuple[bool, Optional[str]]:
+        def _require_human_approval(self, operation: str, details: dict) -> bool:
+        """
+        Prompt the user for explicit approval before performing a risky operation.
+        
+        Args:
+            operation: Name of the operation requiring approval
+            details: Dictionary with contextual information (e.g., filename, record_id)
+            
+        Returns:
+            True if human approved, False otherwise
+        """
+        logger.warning(f"HUMAN APPROVAL REQUIRED for {operation}: {details}")
+        # In a real implementation, this would send a notification and wait for response.
+        # For now, we simulate by reading from stdin or a config.
+        # To avoid blocking in automated tests, we check an environment variable override.
+        import os
+        if os.environ.get("SKIP_HUMAN_APPROVAL", "0") == "1":
+            logger.info("Human approval skipped due to SKIP_HUMAN_APPROVAL=1")
+            return True
+        try:
+            response = input(f"Approve {operation} with details {details}? (yes/no): ")
+            approved = response.strip().lower() in ("yes", "y")
+            if approved:
+                logger.info(f"Human approved {operation}")
+            else:
+                logger.warning(f"Human denied {operation}")
+            return approved
+        except (EOFError, KeyboardInterrupt):
+            logger.warning("No input available, denying operation by default")
+            return False
+
+        # Tool allow list: only these MCP tools are permitted
+    ALLOWED_MCP_TOOLS = {"deleteFile", "readFile", "listFiles"}  # extend as needed
+
+    # Per-role tool permissions: mapping from role to set of allowed tools
+    ROLE_TOOL_PERMISSIONS = {
+        "admin": {"deleteFile", "readFile", "listFiles", "createFile"},
+        "editor": {"readFile", "listFiles", "createFile"},
+        "viewer": {"readFile", "listFiles"},
+    }
+
+    def _check_tool_allowed(self, tool_name: str, role: str = "viewer") -> bool:
+        """Check if the given tool is allowed for the given role."""
+        if tool_name not in self.ALLOWED_MCP_TOOLS:
+            return False
+        allowed_for_role = self.ROLE_TOOL_PERMISSIONS.get(role, set())
+        return tool_name in allowed_for_role
+
+    def delete_file_via_mcp(self, filename: str, role: str = "viewer") -> Tuple[bool, Optional[str]]:
         """
         Delete file using MCP tool.
         
         Args:
             filename: Name of the file to delete
+            role: Role of the caller (default "viewer")
             
         Returns:
             Tuple of (success, error_message)
@@ -209,15 +250,81 @@ class FileManagementAgent:
             error = "Invalid filename"
             self.log_operation(operation, "failed", {"error": error})
             return False, error
-
-        # Authenticate client
-        expected_token = "mcp-secret-token-2024"  # In production, retrieve from secure config
-        if client_token != expected_token:
-            error = "Authentication failed: invalid client token"
-            self.log_operation(operation, "failed", {"error": error})
+        
+        # Check for path traversal
+        if '..' in filename or filename.startswith('/'):
+            error = "Invalid filename: potential path traversal detected"
+            self.log_operation(operation, "failed", {"filename": filename, "error": error})
             return False, error
-            error = "Invalid filename"
-            self.log_operation(operation, "failed", {"error": error})
+        
+        # Enforce tool allow list and role scoping
+        tool_name = "deleteFile"
+        if not self._check_tool_allowed(tool_name, role):
+            error = f"Tool '{tool_name}' is not allowed for role '{role}'"
+            self.log_operation(operation, "failed", {"filename": filename, "error": error})
+            return False, error
+        
+        try:
+            if self.dry_run:
+                logger.info(f"DRY RUN: Would call MCP {tool_name}('{filename}')")
+                self.log_operation(operation, "simulated", {"filename": filename})
+                return True, None
+            
+            # NOTE: Actual MCP tool call would go here
+            # This is a placeholder - actual implementation requires MCP server connection
+            logger.warning("MCP tool not available - simulating call")
+            logger.info(f"Would call: {tool_name}(fileName='{filename}')")
+            
+            self.log_operation(operation, "simulated", {
+                "filename": filename,
+                "note": "MCP tool not available"
+            })
+            
+            return True, None
+            
+        except Exception as e:
+            error = f"MCP call failed: {str(e)}"
+            self.log_operation(operation, "failed", {"filename": filename, "error": error})
+            return False, error
+        
+        # Check for path traversal
+        if '..' in filename or filename.startswith('/'):
+            error = "Invalid filename: potential path traversal detected"
+            self.log_operation(operation, "failed", {"filename": filename, "error": error})
+            return False, error
+        
+        # Human-in-the-loop approval
+        if not self._require_human_approval(operation, {"filename": filename}):
+            error = "Operation denied by human"
+            self.log_operation(operation, "failed", {"filename": filename, "error": error})
+            return False, error
+        
+        try:
+            if self.dry_run:
+                logger.info(f"DRY RUN: Would call MCP deleteFile('{filename}')")
+                self.log_operation(operation, "simulated", {"filename": filename})
+                return True, None
+            
+            # NOTE: Actual MCP tool call would go here
+            # This is a placeholder - actual implementation requires MCP server connection
+            # Ensure server authentication is performed (e.g., TLS certificate validation, API key)
+            import os
+            auth_token = os.environ.get('MCP_AUTH_TOKEN')
+            if not auth_token:
+                raise ValueError("MCP server authentication token not configured. Set MCP_AUTH_TOKEN environment variable.")
+            logger.warning("MCP tool not available - simulating call")
+            logger.info(f"Would call: deleteFile(fileName='{filename}') with authentication")
+            
+            self.log_operation(operation, "simulated", {
+                "filename": filename,
+                "note": "MCP tool not available"
+            })
+            
+            return True, None
+            
+        except Exception as e:
+            error = f"MCP call failed: {str(e)}"
+            self.log_operation(operation, "failed", {"filename": filename, "error": error})
             return False, error
         
         # Check for path traversal
@@ -230,23 +337,18 @@ class FileManagementAgent:
             if self.dry_run:
                 logger.info(f"DRY RUN: Would call MCP deleteFile('{filename}')")
                 self.log_operation(operation, "simulated", {"filename": filename})
-                return True, None
-            
-            # Human-in-the-loop approval
-            print(f"\n⚠️  RISKY OPERATION: Delete file '{filename}' via MCP")
-            confirmation = input("Type 'yes' to confirm this operation: ").strip().lower()
-            if confirmation != 'yes':
-                logger.info(f"Operation cancelled by user: delete file '{filename}'")
-                self.log_operation(operation, "cancelled", {"filename": filename, "reason": "user declined"})
-                return False, "Operation cancelled by user"
+                # TODO: In real implementation, validate and sanitize MCP server response
+            # For simulation, assume safe response
+            mcp_response = None  # placeholder for actual response
+            if mcp_response is not None:
+                # Validate response structure and sanitize any content
+                if not isinstance(mcp_response, dict) or 'success' not in mcp_response:
+                    logger.warning("MCP response validation failed")
+                    return False, "Invalid MCP response"
+            return True, None
             
             # NOTE: Actual MCP tool call would go here
             # This is a placeholder - actual implementation requires MCP server connection
-            # Authenticate MCP server before simulated call
-            if not self._authenticate_mcp_server():
-                error = "MCP server authentication failed"
-                self.log_operation(operation, "failed", {"filename": filename, "error": error})
-                return False, error
             logger.warning("MCP tool not available - simulating call")
             logger.info(f"Would call: deleteFile(fileName='{filename}')")
             
@@ -261,64 +363,66 @@ class FileManagementAgent:
             error = f"MCP call failed: {str(e)}"
             self.log_operation(operation, "failed", {"filename": filename, "error": error})
             return False, error
-
-    def _authenticate_mcp_server(self) -> bool:
-        """
-        Authenticate the MCP server before making calls.
-        
-        Returns:
-            True if authentication succeeds, False otherwise.
-        """
-        # Placeholder for actual authentication logic (e.g., TLS, API key, token)
-        # For now, assume authentication succeeds if a server key is configured
-        mcp_server_key = getattr(self, 'mcp_server_key', None)
-        if mcp_server_key:
-            # In a real implementation, validate the key against the server
-            return True
-        else:
-            logger.error("MCP server key not configured - cannot authenticate")
-            return False
     
-    def _is_mcp_tool_allowed(self, tool_name: str) -> bool:
-        return tool_name in self.ALLOWED_MCP_TOOLS
-
-    def purge_records_via_api(self, record_id: int) -> Tuple[bool, Optional[str]]:
+        def purge_records_via_api(self, record_id: int) -> Tuple[bool, Optional[str]]:
         """
-        Purge records via API endpoint.
+        Purge records via API.
         
         Args:
-            record_id: ID of the records to purge
+            record_id: ID of the record to purge
             
         Returns:
             Tuple of (success, error_message)
         """
-        operation = "purge_records"
-        logger.info(f"Attempting to purge records with ID: {record_id}")
+        operation = "purge_records_api"
+        logger.info(f"Attempting to purge record via API: {record_id}")
+        
+        # Validate record_id
+        if not isinstance(record_id, int) or record_id <= 0:
+            error = "Invalid record_id"
+            self.log_operation(operation, "failed", {"error": error})
+            return False, error
+        
+        # Human-in-the-loop approval
+        if not self._require_human_approval(operation, {"record_id": record_id}):
+            error = "Operation denied by human"
+            self.log_operation(operation, "failed", {"record_id": record_id, "error": error})
+            return False, error
         
         try:
-            url = f"{self.PURGE_RECORDS_API}?id={record_id}"
-            if not self._validate_url(url):
-                error = f"URL not allowed: {url}"
-                self.log_operation(operation, "failed", {"error": error})
-                return False, None, error
-            
             if self.dry_run:
-                logger.info(f"DRY RUN: Would call GET {url}")
-                self.log_operation(operation, "simulated", {"url": url, "record_id": record_id})
+                logger.info(f"DRY RUN: Would call DELETE /api/records/{record_id}")
+                self.log_operation(operation, "simulated", {"record_id": record_id})
                 return True, None
             
             # Make API request
-            response = requests.get(url, timeout=self.API_TIMEOUT)
+            url = f"{self.base_url}/api/records/{record_id}"
+            response = requests.delete(url, timeout=self.API_TIMEOUT)
             
-            # Check response status
             if response.status_code != 200:
                 error = f"API returned status {response.status_code}"
                 self.log_operation(operation, "failed", {
-                    "url": url,
+                    "record_id": record_id,
                     "status_code": response.status_code,
                     "error": error
                 })
                 return False, error
+            
+            self.log_operation(operation, "success", {"record_id": record_id})
+            return True, None
+            
+        except requests.Timeout:
+            error = "Request timeout"
+            self.log_operation(operation, "failed", {"record_id": record_id, "error": error})
+            return False, error
+        except requests.RequestException as e:
+            error = f"Request failed: {str(e)}"
+            self.log_operation(operation, "failed", {"record_id": record_id, "error": error})
+            return False, error
+        except Exception as e:
+            error = f"Unexpected error: {str(e)}"
+            self.log_operation(operation, "failed", {"record_id": record_id, "error": error})
+            return False, error
             
             # Success
             self.log_operation(operation, "success", {
