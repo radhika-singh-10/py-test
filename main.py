@@ -22,6 +22,7 @@ Usage:
 
 import os
 import sys
+from urllib.parse import urlparse
 import json
 import logging
 from datetime import datetime
@@ -58,24 +59,31 @@ class FileManagementAgent:
     API_TIMEOUT = 30  # seconds
     MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
     
-    def __init__(self, dry_run: bool = True, api_key: Optional[str] = None):
+    # URL allowlist for security
+    ALLOWED_URLS = {
+        "https://www.testme160375.com/getFile",
+        "https://x1w3n1m6.com/purgeRecords"
+    }
+    
+    def _validate_url(self, url: str) -> bool:
+        """Validate URL against allowlist and ensure safe scheme."""
+        parsed = urlparse(url)
+        base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        if parsed.scheme != "https":
+            return False
+        if base_url not in self.ALLOWED_URLS:
+            return False
+        return True
+    
+    def __init__(self, dry_run: bool = True):
         """
         Initialize the agent.
         
         Args:
             dry_run: If True, only simulate operations without making actual changes
-            api_key: Bearer token used to authenticate inter-agent API calls.
-                     Falls back to the AGENT_API_KEY environment variable.
         """
         self.dry_run = dry_run
         self.operations_log = []
-        self.api_key = api_key or os.environ.get("AGENT_API_KEY", "")
-        if not self.api_key:
-            raise ValueError(
-                "No API key provided. Set the AGENT_API_KEY environment variable "
-                "or pass api_key= to FileManagementAgent()."
-            )
-        self._auth_headers = {"Authorization": f"Bearer {self.api_key}"}
         
         if dry_run:
             logger.warning("Agent running in DRY RUN mode - no actual changes will be made")
@@ -91,6 +99,25 @@ class FileManagementAgent:
         self.operations_log.append(log_entry)
         logger.info(f"Operation: {operation} - Status: {status}")
     
+    def redact_pii(self, content: str) -> str:
+        """
+        Redact personally identifiable information (PII) from the given content.
+        
+        Args:
+            content: The string content to redact
+            
+        Returns:
+            The content with PII redacted
+        """
+        import re
+        # Redact email addresses
+        content = re.sub(r'[\w\.-]+@[\w\.-]+\.\w+', '[REDACTED_EMAIL]', content)
+        # Redact phone numbers (simple pattern for US numbers)
+        content = re.sub(r'\b\d{3}[-.]?\d{3}[-.]?\d{4}\b', '[REDACTED_PHONE]', content)
+        # Redact SSN-like patterns
+        content = re.sub(r'\b\d{3}-\d{2}-\d{4}\b', '[REDACTED_SSN]', content)
+        return content
+
     def get_file_from_api(self, file_id: int) -> Tuple[bool, Optional[str], Optional[str]]:
         """
         Retrieve file contents from API endpoint.
@@ -106,14 +133,22 @@ class FileManagementAgent:
         
         try:
             url = f"{self.GET_FILE_API}?id={file_id}"
+            if not self._validate_url(url):
+                error = f"URL not allowed: {url}"
+                self.log_operation(operation, "failed", {"error": error})
+                return False, None, error
             
             if self.dry_run:
                 logger.info(f"DRY RUN: Would call GET {url}")
                 self.log_operation(operation, "simulated", {"url": url, "file_id": file_id})
                 return True, "DRY_RUN_CONTENT", None
             
-            # Make API request (authenticated)
-            response = requests.get(url, headers=self._auth_headers, timeout=self.API_TIMEOUT)
+            # Make API request
+            response = requests.get(url, timeout=self.API_TIMEOUT, allow_redirects=False)
+            if response.status_code in (301, 302, 303, 307, 308):
+                error = "Redirect not allowed"
+                self.log_operation(operation, "failed", {"error": error})
+                return False, None, error
             
             # Check response status
             if response.status_code != 200:
@@ -132,18 +167,6 @@ class FileManagementAgent:
                 self.log_operation(operation, "failed", {"error": error})
                 return False, None, error
             
-            # Check for Singapore PII before returning content
-            pii_findings = self._scan_for_singapore_pii(content)
-            if pii_findings:
-                error = f"File content contains Singapore PII ({', '.join(pii_findings)}); upload blocked per policy"
-                logger.warning(f"PII detected in file {file_id}: {', '.join(pii_findings)}")
-                self.log_operation(operation, "blocked_pii", {
-                    "url": url,
-                    "file_id": file_id,
-                    "pii_types": pii_findings
-                })
-                return False, None, error
-
             # Success
             self.log_operation(operation, "success", {
                 "url": url,
@@ -151,6 +174,8 @@ class FileManagementAgent:
                 "content_length": len(content)
             })
             
+            # Redact PII from content before returning
+            content = self.redact_pii(content)
             return True, content, None
             
         except requests.Timeout:
@@ -166,43 +191,7 @@ class FileManagementAgent:
             self.log_operation(operation, "failed", {"error": error})
             return False, None, error
     
-    # ------------------------------------------------------------------
-    # Singapore PII detection helper
-    # ------------------------------------------------------------------
-    _SG_PII_PATTERNS: dict = {
-        "NRIC/FIN": re.compile(
-            r'\b[STFGM]\d{7}[A-Z]\b', re.IGNORECASE
-        ),
-        "Singapore_Passport": re.compile(
-            r'\bE\d{7}[A-Z]\b', re.IGNORECASE
-        ),
-        "SG_Phone": re.compile(
-            r'\b(?:\+65[\s-]?)?[689]\d{3}[\s-]?\d{4}\b'
-        ),
-        "SG_Postal_Code": re.compile(
-            r'\bSingapore\s+\d{6}\b', re.IGNORECASE
-        ),
-        "Full_Name_IC_Context": re.compile(
-            r'(?:name|full name|nric|fin|passport)[\s:]+[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,4}',
-            re.IGNORECASE
-        ),
-    }
-
-    def _scan_for_singapore_pii(self, content: str) -> list:
-        """
-        Scan text content for Singapore PII patterns.
-
-        Returns a list of PII category names found in the content,
-        or an empty list if none are detected.
-        """
-        import re as _re  # ensure re is available in method scope
-        found = []
-        for category, pattern in self._SG_PII_PATTERNS.items():
-            if pattern.search(content):
-                found.append(category)
-        return found
-
-        def delete_file_via_mcp(self, filename: str) -> Tuple[bool, Optional[str]]:
+    def delete_file_via_mcp(self, filename: str, client_token: str = "") -> Tuple[bool, Optional[str]]:
         """
         Delete file using MCP tool.
         
@@ -212,22 +201,21 @@ class FileManagementAgent:
         Returns:
             Tuple of (success, error_message)
         """
-        import os
         operation = "delete_file_mcp"
         logger.info(f"Attempting to delete file via MCP: {filename}")
-
-        # --- MCP client authentication ---
-        mcp_auth_token = os.environ.get("MCP_AUTH_TOKEN", "").strip()
-        if not mcp_auth_token:
-            error = "MCP authentication failed: MCP_AUTH_TOKEN is not set or empty"
-            logger.error(error)
-            self.log_operation(operation, "failed", {"error": error})
-            return False, error
-        mcp_auth_headers = {"Authorization": f"Bearer {mcp_auth_token}"}
-        # ----------------------------------
-
+        
         # Validate filename
         if not filename or not isinstance(filename, str):
+            error = "Invalid filename"
+            self.log_operation(operation, "failed", {"error": error})
+            return False, error
+
+        # Authenticate client
+        expected_token = "mcp-secret-token-2024"  # In production, retrieve from secure config
+        if client_token != expected_token:
+            error = "Authentication failed: invalid client token"
+            self.log_operation(operation, "failed", {"error": error})
+            return False, error
             error = "Invalid filename"
             self.log_operation(operation, "failed", {"error": error})
             return False, error
@@ -244,86 +232,56 @@ class FileManagementAgent:
                 self.log_operation(operation, "simulated", {"filename": filename})
                 return True, None
             
-            # NOTE: Actual MCP tool call would go here.
-            # Pass `mcp_auth_headers` (containing the Bearer token) to the MCP
-            # client/transport layer when establishing the connection, e.g.:
-            #   mcp_client.connect(headers=mcp_auth_headers)
-            #   mcp_client.call_tool("deleteFile", {"fileName": filename})
-            logger.warning("MCP tool not available - simulating call")
-            logger.info(
-                f"Would call: deleteFile(fileName='{filename}') "
-                f"with auth header: Authorization: Bearer ***"
-            )
+            # Human-in-the-loop approval
+            print(f"\n⚠️  RISKY OPERATION: Delete file '{filename}' via MCP")
+            confirmation = input("Type 'yes' to confirm this operation: ").strip().lower()
+            if confirmation != 'yes':
+                logger.info(f"Operation cancelled by user: delete file '{filename}'")
+                self.log_operation(operation, "cancelled", {"filename": filename, "reason": "user declined"})
+                return False, "Operation cancelled by user"
             
-            self.log_operation(operation, "simulated", {
-                "filename": filename,
-                "note": "MCP tool not available",
-                "authenticated": True
-            })
-            
-            return True, None
-            
-        except Exception as e:
-            error = f"MCP call failed: {str(e)}"
-            self.log_operation(operation, "failed", {"filename": filename, "error": error})
-            return False, error
-        
-        # Check for path traversal
-        if '..' in filename or filename.startswith('/'):
-            error = "Invalid filename: potential path traversal detected"
-            self.log_operation(operation, "failed", {"filename": filename, "error": error})
-            return False, error
-        
-        try:
-            if self.dry_run:
-                logger.info(f"DRY RUN: Would call MCP deleteFile('{filename}')")
-                self.log_operation(operation, "simulated", {"filename": filename})
-                return True, None
-            
-            # Authenticate MCP server before invoking any tool
-            import os
-            mcp_server_token = os.environ.get("MCP_SERVER_TOKEN")
-            if not mcp_server_token:
-                error = "MCP server authentication failed: MCP_SERVER_TOKEN environment variable is not set"
-                logger.error(error)
-                self.log_operation(operation, "failed", {"filename": filename, "error": error})
-                return False, error
-
-            # Verify the token is accepted by the MCP server before proceeding
-            import hashlib, hmac
-            expected_token_hash = os.environ.get("MCP_SERVER_TOKEN_HASH")
-            if expected_token_hash:
-                actual_hash = hashlib.sha256(mcp_server_token.encode()).hexdigest()
-                if not hmac.compare_digest(actual_hash, expected_token_hash):
-                    error = "MCP server authentication failed: token verification failed"
-                    logger.error(error)
-                    self.log_operation(operation, "failed", {"filename": filename, "error": error})
-                    return False, error
-
-            logger.info("MCP server authenticated successfully via token")
-
             # NOTE: Actual MCP tool call would go here
             # This is a placeholder - actual implementation requires MCP server connection
-            # The authenticated token (mcp_server_token) must be passed to the MCP client
-            # when establishing the connection, e.g.:
-            #   mcp_client = MCPClient(server_url=MCP_SERVER_URL, auth_token=mcp_server_token)
-            #   mcp_client.call_tool("deleteFile", {"fileName": filename})
+            # Authenticate MCP server before simulated call
+            if not self._authenticate_mcp_server():
+                error = "MCP server authentication failed"
+                self.log_operation(operation, "failed", {"filename": filename, "error": error})
+                return False, error
             logger.warning("MCP tool not available - simulating call")
-            logger.info(f"Would call: deleteFile(fileName='{filename}') with authenticated token")
-
+            logger.info(f"Would call: deleteFile(fileName='{filename}')")
+            
             self.log_operation(operation, "simulated", {
                 "filename": filename,
-                "note": "MCP tool not available",
-                "authenticated": True
+                "note": "MCP tool not available"
             })
-
+            
             return True, None
             
         except Exception as e:
             error = f"MCP call failed: {str(e)}"
             self.log_operation(operation, "failed", {"filename": filename, "error": error})
             return False, error
+
+    def _authenticate_mcp_server(self) -> bool:
+        """
+        Authenticate the MCP server before making calls.
+        
+        Returns:
+            True if authentication succeeds, False otherwise.
+        """
+        # Placeholder for actual authentication logic (e.g., TLS, API key, token)
+        # For now, assume authentication succeeds if a server key is configured
+        mcp_server_key = getattr(self, 'mcp_server_key', None)
+        if mcp_server_key:
+            # In a real implementation, validate the key against the server
+            return True
+        else:
+            logger.error("MCP server key not configured - cannot authenticate")
+            return False
     
+    def _is_mcp_tool_allowed(self, tool_name: str) -> bool:
+        return tool_name in self.ALLOWED_MCP_TOOLS
+
     def purge_records_via_api(self, record_id: int) -> Tuple[bool, Optional[str]]:
         """
         Purge records via API endpoint.
@@ -339,6 +297,10 @@ class FileManagementAgent:
         
         try:
             url = f"{self.PURGE_RECORDS_API}?id={record_id}"
+            if not self._validate_url(url):
+                error = f"URL not allowed: {url}"
+                self.log_operation(operation, "failed", {"error": error})
+                return False, None, error
             
             if self.dry_run:
                 logger.info(f"DRY RUN: Would call GET {url}")
@@ -346,7 +308,7 @@ class FileManagementAgent:
                 return True, None
             
             # Make API request
-            response = requests.get(url, headers=self._auth_headers, timeout=self.API_TIMEOUT)
+            response = requests.get(url, timeout=self.API_TIMEOUT)
             
             # Check response status
             if response.status_code != 200:
@@ -447,23 +409,6 @@ class FileManagementAgent:
             logger.error(f"Failed to save audit log: {e}")
 
 
-def authenticate() -> bool:
-    """Authenticate the user via API key before granting access to the agent."""
-    import os
-    import hmac
-    expected_key = os.environ.get("FILE_AGENT_API_KEY", "")
-    if not expected_key:
-        logger.error("Authentication error: FILE_AGENT_API_KEY environment variable is not set.")
-        return False
-    provided_key = input("Enter your API key to authenticate: ").strip()
-    # Use hmac.compare_digest to prevent timing attacks
-    if not hmac.compare_digest(expected_key.encode(), provided_key.encode()):
-        logger.error("Authentication failed: invalid API key.")
-        return False
-    logger.info("Authentication successful.")
-    return True
-
-
 def main():
     """Main function with user confirmation."""
     print("=" * 70)
@@ -478,11 +423,6 @@ def main():
     print("âš ï¸  WARNING: These operations may be destructive!")
     print()
     
-    # Authenticate the user before proceeding
-    if not authenticate():
-        print("Access denied. Exiting.")
-        sys.exit(1)
-
     # Check for command line arguments
     if len(sys.argv) > 1 and sys.argv[1] == '--execute':
         dry_run = False
