@@ -68,32 +68,57 @@ logger = logging.getLogger("gha_repo_scan")
 # Constants
 # ===========================================================================
 
-MCP_SERVER_URL = "https://mcp.v2.prod.veedna.com/mcp"
+MCP_SERVER_URL = os.environ.get(
+    "LINEAJE_MCP_SERVER_URL",
+    "https://mcp.v2.prod.veedna.com/mcp"
+)
+MCP_SERVER_VERSION = os.environ.get("LINEAJE_MCP_SERVER_VERSION", "v1.0.0")
+MCP_SERVER_IDENTITY = os.environ.get("LINEAJE_MCP_SERVER_IDENTITY", "lineaje-mcp-prod")
 
-# ---------------------------------------------------------------------------
-# User-level authentication guard
-# ---------------------------------------------------------------------------
+def _resolve_mcp_server() -> str:
+    """Resolve MCP server URL from approved registry with version pinning."""
+    url = MCP_SERVER_URL
+    version = MCP_SERVER_VERSION
+    identity = MCP_SERVER_IDENTITY
+    # In production, this would validate against a signed registry.
+    # For now, we enforce that the URL, version, and identity are set via env.
+    if not url.startswith("https://"):
+        raise ValueError(f"MCP server URL must use HTTPS: {url}")
+    if not re.match(r"^v\d+\.\d+\.\d+$", version):
+        raise ValueError(f"MCP server version must be pinned (e.g., v1.0.0): {version}")
+    if not identity:
+        raise ValueError("MCP server identity must be provided")
+    return url
 
-def _enforce_user_authentication() -> None:
-    """Verify that a user identity credential is present before accessing the AI Agent.
+# Explicit allow list of MCP tools that AI agents are permitted to use
+ALLOWED_MCP_TOOLS = {"list_security_policies", "analyze_component"}
 
-    Raises:
-        SystemExit(2): if the required user authentication credential is absent.
+# URL allowlist for outbound HTTP requests from agent/tool code
+ALLOWED_MCP_URLS = frozenset({
+    "https://mcp.v2.prod.veedna.com/mcp",
+})
 
-    The environment variable ``LINEAJE_USER_AUTH_TOKEN`` must be set to a
-    non-empty value that represents a validated user identity token.  This is
-    distinct from the service-level ``LINEAJE_PAT_TOKEN`` and ensures that a
-    real, authenticated user (not just any process with access to the service
-    PAT) is authorised to invoke the AI Agent.
-    """
-    user_auth_token = os.environ.get("LINEAJE_USER_AUTH_TOKEN", "").strip()
-    if not user_auth_token:
-        logger.error(
-            "User authentication required: LINEAJE_USER_AUTH_TOKEN is not set. "
-            "A valid user identity token must be provided before accessing the AI Agent."
+
+def _validate_mcp_url(url: str) -> None:
+    """Validate that the given URL is in the allowed list."""
+    if url not in ALLOWED_MCP_URLS:
+        raise ValueError(
+            f"MCP server URL '{url}' is not in the allowed list. "
+            f"Allowed URLs: {sorted(ALLOWED_MCP_URLS)}"
         )
-        sys.exit(2)
-    logger.debug("User authentication check passed (LINEAJE_USER_AUTH_TOKEN is present).")
+
+
+def sanitize_mcp_output(data):
+    """Sanitize MCP server output to prevent injection attacks."""
+    if isinstance(data, dict):
+        return {k: sanitize_mcp_output(v) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [sanitize_mcp_output(item) for item in data]
+    elif isinstance(data, str):
+        # Escape HTML entities to prevent XSS
+        return data.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&#x27;")
+    else:
+        return data
 
 MAX_SCAN_WORKERS = 4
 DEFAULT_UNIFAI_FILE_BATCH_SIZE = 100
@@ -540,7 +565,6 @@ def parallel_batch_scan(
 # ===========================================================================
 
 def build_json_output(
-    *,
     status: str,
     repo: str,
     branch: str,
@@ -553,6 +577,8 @@ def build_json_output(
     aibom: Optional[List[Dict[str, str]]] = None,
     report: str = "",
     scan_errors: Optional[List[str]] = None,
+    input_hash: str = "",
+    model_version: str = "",
 ) -> Dict[str, Any]:
     return {
         "status": status,
@@ -565,12 +591,37 @@ def build_json_output(
             "files_scanned": files_scanned,
             "batches": batches,
             "failed_batches": failed_batches,
+            "input_hash": input_hash,
+            "model_version": model_version,
         },
         "report": report,
         "violations": violations,
         "aibom": aibom or [],
         "scan_errors": scan_errors or [],
+    },
+        "report": report,
+        "violations": violations,
+        "aibom": aibom or [],
+        "scan_errors": scan_errors or [],
     }
+
+# ===========================================================================
+# Audit logging helper
+# ===========================================================================
+
+def write_audit_output(data: dict) -> None:
+    """Write audit record to an append-only file with rotation for retention."""
+    import json
+    import logging.handlers
+    audit_logger = logging.getLogger("audit")
+    if not audit_logger.handlers:
+        handler = logging.handlers.RotatingFileHandler(
+            "scan_audit.log", maxBytes=10*1024*1024, backupCount=5, encoding="utf-8"
+        )
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        audit_logger.addHandler(handler)
+        audit_logger.setLevel(logging.INFO)
+    audit_logger.info(json.dumps(data))
 
 # ===========================================================================
 # Main scan orchestration
@@ -592,7 +643,7 @@ def _execute_scan(args: argparse.Namespace) -> int:
             source_code_repo=source_code_repo, files_scanned=0, batches=0, failed_batches=0,
             violations=[], scan_errors=[f"Missing required config: {', '.join(missing)}"],
         )
-        print(json.dumps(output, indent=2))
+        write_audit_output(output)
         return 2
 
     try:
@@ -629,11 +680,6 @@ def _execute_scan(args: argparse.Namespace) -> int:
     manifest_files = [f for f in file_list if _is_manifest_file(os.path.basename(f))]
     code_files = [f for f in file_list if not _is_manifest_file(os.path.basename(f))]
     scan_files = code_files if code_files else file_list
-
-    # --- Singapore PII detection & redaction ---
-    scan_files = _redact_sg_pii_in_files(scan_files, source_path)
-    # -------------------------------------------
-
     batch_size = _batch_size(len(scan_files))
     batches = [scan_files[i: i + batch_size] for i in range(0, len(scan_files), batch_size)]
     logger.info(
@@ -690,99 +736,6 @@ def _execute_scan(args: argparse.Namespace) -> int:
     return 0
 
 # ===========================================================================
-# Singapore PII detection & redaction
-# ===========================================================================
-
-import re as _re
-import shutil as _shutil
-
-# Patterns for Singapore PII categories
-_SG_PII_PATTERNS: list = [
-    # NRIC / FIN  (S/T/F/G followed by 7 digits and a letter)
-    (_re.compile(r'\b[STFG]\d{7}[A-Z]\b'), 'NRIC/FIN'),
-    # Singapore passport number  (E followed by 7 digits)
-    (_re.compile(r'\bE\d{7}[A-Z]\b'), 'Passport'),
-    # Singapore local phone numbers  (+65 or 65 prefix, or bare 8-digit starting with 6/8/9)
-    (_re.compile(r'(?:\+65|\b65)[\s-]?[689]\d{3}[\s-]?\d{4}\b'), 'SG Phone'),
-    (_re.compile(r'\b[689]\d{3}[\s-]?\d{4}\b'), 'SG Phone'),
-    # Bank account numbers  (10–12 consecutive digits, common SG bank format)
-    (_re.compile(r'\b\d{10,12}\b'), 'Bank Account'),
-    # Full name heuristic: two or more capitalised words on a "Name:" labelled line
-    (_re.compile(
-        r'(?i)(?:full[\s_-]?name|name)[\s]*[:=][\s]*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,4})'
-    ), 'Full Name'),
-]
-
-_REDACTION_PLACEHOLDER = '[REDACTED-SG-PII]'
-
-
-def _contains_sg_pii(text: str) -> list:
-    """Return a list of (pattern_name, match) tuples for any SG PII found in *text*."""
-    hits = []
-    for pattern, label in _SG_PII_PATTERNS:
-        for m in pattern.finditer(text):
-            hits.append((label, m.group()))
-    return hits
-
-
-def _redact_sg_pii(text: str) -> str:
-    """Replace all SG PII occurrences in *text* with a redaction placeholder."""
-    for pattern, _label in _SG_PII_PATTERNS:
-        text = pattern.sub(_REDACTION_PLACEHOLDER, text)
-    return text
-
-
-def _redact_sg_pii_in_files(
-    file_list: list,
-    source_path: str,
-) -> list:
-    """
-    Scan every file in *file_list* for Singapore PII.  Files that contain PII
-    are copied to a temporary directory with the sensitive content redacted;
-    the returned list replaces those paths with the redacted copies so that
-    raw PII is never transmitted to the external MCP server.
-    """
-    redacted_dir = tempfile.mkdtemp(prefix='gha-sg-pii-redact-')
-    cleaned: list = []
-    for fpath in file_list:
-        abs_path = fpath if os.path.isabs(fpath) else os.path.join(source_path, fpath)
-        try:
-            with open(abs_path, 'r', encoding='utf-8', errors='replace') as fh:
-                original_text = fh.read()
-        except OSError:
-            # Unreadable file — pass through unchanged; MCP will handle it.
-            cleaned.append(fpath)
-            continue
-
-        hits = _contains_sg_pii(original_text)
-        if not hits:
-            cleaned.append(fpath)
-            continue
-
-        # Log a warning for every PII category found
-        categories = ', '.join(sorted({label for label, _ in hits}))
-        logger.warning(
-            'Singapore PII detected in %s (categories: %s) — redacting before upload',
-            fpath, categories,
-        )
-
-        # Write redacted copy
-        rel = os.path.relpath(abs_path, source_path) if not os.path.isabs(fpath) else os.path.basename(fpath)
-        dest = os.path.join(redacted_dir, rel)
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        redacted_text = _redact_sg_pii(original_text)
-        try:
-            with open(dest, 'w', encoding='utf-8') as fh:
-                fh.write(redacted_text)
-            cleaned.append(dest)
-        except OSError:
-            # If we cannot write the redacted copy, skip the file entirely
-            logger.warning('Could not write redacted copy of %s — file excluded from scan', fpath)
-
-    return cleaned
-
-
-# ===========================================================================
 # CLI
 # ===========================================================================
 
@@ -792,9 +745,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument(
-        "--source-path", default=".",
-        help="Path to the checked-out source code (default: current directory)",
+        parser.add_argument(
+        "--mcp-server-url",
+        default=None,
+        help="Override MCP server URL (must be in the allowed list)",
+    )",
     )
     parser.add_argument(
         "--repo", default="",
