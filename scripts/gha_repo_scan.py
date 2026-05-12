@@ -68,7 +68,57 @@ logger = logging.getLogger("gha_repo_scan")
 # Constants
 # ===========================================================================
 
-MCP_SERVER_URL = "https://mcp.v2.prod.veedna.com/mcp"
+MCP_SERVER_URL = os.environ.get(
+    "LINEAJE_MCP_SERVER_URL",
+    "https://mcp.v2.prod.veedna.com/mcp"
+)
+MCP_SERVER_VERSION = os.environ.get("LINEAJE_MCP_SERVER_VERSION", "v1.0.0")
+MCP_SERVER_IDENTITY = os.environ.get("LINEAJE_MCP_SERVER_IDENTITY", "lineaje-mcp-prod")
+
+def _resolve_mcp_server() -> str:
+    """Resolve MCP server URL from approved registry with version pinning."""
+    url = MCP_SERVER_URL
+    version = MCP_SERVER_VERSION
+    identity = MCP_SERVER_IDENTITY
+    # In production, this would validate against a signed registry.
+    # For now, we enforce that the URL, version, and identity are set via env.
+    if not url.startswith("https://"):
+        raise ValueError(f"MCP server URL must use HTTPS: {url}")
+    if not re.match(r"^v\d+\.\d+\.\d+$", version):
+        raise ValueError(f"MCP server version must be pinned (e.g., v1.0.0): {version}")
+    if not identity:
+        raise ValueError("MCP server identity must be provided")
+    return url
+
+# Explicit allow list of MCP tools that AI agents are permitted to use
+ALLOWED_MCP_TOOLS = {"list_security_policies", "analyze_component"}
+
+# URL allowlist for outbound HTTP requests from agent/tool code
+ALLOWED_MCP_URLS = frozenset({
+    "https://mcp.v2.prod.veedna.com/mcp",
+})
+
+
+def _validate_mcp_url(url: str) -> None:
+    """Validate that the given URL is in the allowed list."""
+    if url not in ALLOWED_MCP_URLS:
+        raise ValueError(
+            f"MCP server URL '{url}' is not in the allowed list. "
+            f"Allowed URLs: {sorted(ALLOWED_MCP_URLS)}"
+        )
+
+
+def sanitize_mcp_output(data):
+    """Sanitize MCP server output to prevent injection attacks."""
+    if isinstance(data, dict):
+        return {k: sanitize_mcp_output(v) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [sanitize_mcp_output(item) for item in data]
+    elif isinstance(data, str):
+        # Escape HTML entities to prevent XSS
+        return data.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&#x27;")
+    else:
+        return data
 
 MAX_SCAN_WORKERS = 4
 DEFAULT_UNIFAI_FILE_BATCH_SIZE = 100
@@ -515,7 +565,6 @@ def parallel_batch_scan(
 # ===========================================================================
 
 def build_json_output(
-    *,
     status: str,
     repo: str,
     branch: str,
@@ -528,6 +577,8 @@ def build_json_output(
     aibom: Optional[List[Dict[str, str]]] = None,
     report: str = "",
     scan_errors: Optional[List[str]] = None,
+    input_hash: str = "",
+    model_version: str = "",
 ) -> Dict[str, Any]:
     return {
         "status": status,
@@ -540,12 +591,37 @@ def build_json_output(
             "files_scanned": files_scanned,
             "batches": batches,
             "failed_batches": failed_batches,
+            "input_hash": input_hash,
+            "model_version": model_version,
         },
         "report": report,
         "violations": violations,
         "aibom": aibom or [],
         "scan_errors": scan_errors or [],
+    },
+        "report": report,
+        "violations": violations,
+        "aibom": aibom or [],
+        "scan_errors": scan_errors or [],
     }
+
+# ===========================================================================
+# Audit logging helper
+# ===========================================================================
+
+def write_audit_output(data: dict) -> None:
+    """Write audit record to an append-only file with rotation for retention."""
+    import json
+    import logging.handlers
+    audit_logger = logging.getLogger("audit")
+    if not audit_logger.handlers:
+        handler = logging.handlers.RotatingFileHandler(
+            "scan_audit.log", maxBytes=10*1024*1024, backupCount=5, encoding="utf-8"
+        )
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        audit_logger.addHandler(handler)
+        audit_logger.setLevel(logging.INFO)
+    audit_logger.info(json.dumps(data))
 
 # ===========================================================================
 # Main scan orchestration
@@ -567,7 +643,7 @@ def _execute_scan(args: argparse.Namespace) -> int:
             source_code_repo=source_code_repo, files_scanned=0, batches=0, failed_batches=0,
             violations=[], scan_errors=[f"Missing required config: {', '.join(missing)}"],
         )
-        print(json.dumps(output, indent=2))
+        write_audit_output(output)
         return 2
 
     try:
@@ -669,9 +745,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument(
-        "--source-path", default=".",
-        help="Path to the checked-out source code (default: current directory)",
+        parser.add_argument(
+        "--mcp-server-url",
+        default=None,
+        help="Override MCP server URL (must be in the allowed list)",
+    )",
     )
     parser.add_argument(
         "--repo", default="",
