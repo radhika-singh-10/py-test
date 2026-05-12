@@ -2,14 +2,33 @@ name: Lineaje AI Policy Scan
 
 on:
   workflow_dispatch:
+    inputs:
+      source_repo:
+        description: "Repository to scan (owner/repo)"
+        required: true
+      branch:
+        description: "Branch to scan"
+        required: true
+        default: "main"
 
 jobs:
   lineaje-scan:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
+      - name: Checkout target repo
         uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.inputs.source_repo }}
+          ref: ${{ github.event.inputs.branch }}
+          token: ${{ secrets.GH_TOKEN }}
+          path: target-repo
+
+      - name: Checkout scanner scripts
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          path: .lineaje-scanner
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -19,11 +38,18 @@ jobs:
       - name: Install dependencies
         run: pip install mcp
 
-      - name: Run Lineaje AI policy scan
+      - name: Run Lineaje AI policy scan with fix PR
         env:
           LINEAJE_PAT_TOKEN: ${{ secrets.LINEAJE_PAT_TOKEN }}
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
-        run: python scripts/gha_repo_scan_fix.py --source-path . | tee scan_result.json
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          python .lineaje-scanner/scripts/gha_repo_scan_fix.py \
+            --source-path target-repo \
+            --repo "${{ github.event.inputs.source_repo }}" \
+            --branch "${{ github.event.inputs.branch }}" \
+            --create-fix-pr \
+            | tee scan_result.txt
 
-      - name: Log scan result
-        run: cat scan_result.json
+      - name: Publish scan result to job summary
+        if: always()
+        run: cat scan_result.txt >> $GITHUB_STEP_SUMMARY
