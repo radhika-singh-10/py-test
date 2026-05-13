@@ -790,7 +790,8 @@ def _create_fix_pr(
 
     safe_branch = re.sub(r"[^a-zA-Z0-9._/-]", "-", branch)
     sha_short = head_sha[:7]
-    remediation_branch = f"{REMEDIATION_BRANCH_PREFIX}-{safe_branch.replace('/', '-')}-{sha_short}"
+    timestamp = time.strftime("%m%d%H%M")
+    remediation_branch = f"{REMEDIATION_BRANCH_PREFIX}-{safe_branch.replace('/', '-')}-{sha_short}-{timestamp}"
 
     scm = GitHubClient(token=github_token)
 
