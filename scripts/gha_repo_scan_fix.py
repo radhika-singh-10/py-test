@@ -847,7 +847,11 @@ def _create_fix_pr(
         failed_list,
     ]
     if report:
-        pr_body_lines += ["", "---", "", "<details><summary>Full scan report</summary>", "", report, "", "</details>"]
+        MAX_REPORT_CHARS = 56_000  # leave room for rest of PR body; GitHub cap is 65536
+        report_text = report.strip()
+        if len(report_text) > MAX_REPORT_CHARS:
+            report_text = report_text[:MAX_REPORT_CHARS] + "\n\n---\n\n*…Report truncated for GitHub PR body size limit. Retrieve the full text from CI logs.*"
+        pr_body_lines += ["", "---", "", "<details><summary>Full scan report</summary>", "", report_text, "", "</details>"]
     pr_body = "\n".join(pr_body_lines)
 
     try:
