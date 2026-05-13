@@ -559,15 +559,24 @@ def print_human_output(output: Dict[str, Any]) -> None:
     status = output.get("status", "unknown")
     violations = output.get("violations", [])
     scan_errors = output.get("scan_errors", [])
+    metadata = output.get("scan_metadata", {})
+    scanned_at = metadata.get("scanned_at", "")
+    branch = metadata.get("branch", "")
 
     if status == "compliant":
-        status_label = "compliant"
+        status_label = "✅ Compliant"
     elif status == "violations_found":
-        status_label = "not compliant"
+        status_label = "❌ Not Compliant"
     else:
         status_label = status
 
+    print("# UnifAI Security Report")
+    print()
     print(f"**Status:** {status_label}")
+    if branch:
+        print(f"**Branch:** `{branch}`")
+    if scanned_at:
+        print(f"**Scanned at:** {scanned_at}")
 
     if scan_errors:
         print("\n**Errors:**")
@@ -594,8 +603,8 @@ def print_human_output(output: Dict[str, Any]) -> None:
     print("|------|-------------------|")
 
     for file_, controls in sorted(by_file.items()):
-        controls_cell = "<br>".join(controls)
-        print(f"| `{file_}` | {controls_cell} |")
+        numbered = "".join(f"{i}. {c}<br>" for i, c in enumerate(controls, 1))
+        print(f"| `{file_}` | {numbered} |")
 
 
 # ===========================================================================
@@ -780,17 +789,22 @@ def _create_fix_pr(
         return None, ""
 
     safe_branch = re.sub(r"[^a-zA-Z0-9._/-]", "-", branch)
-    remediation_branch = f"{REMEDIATION_BRANCH_PREFIX}-{safe_branch.replace('/', '-')}"
     sha_short = head_sha[:7]
+    remediation_branch = f"{REMEDIATION_BRANCH_PREFIX}-{safe_branch.replace('/', '-')}-{sha_short}"
 
     scm = GitHubClient(token=github_token)
 
+    # Resolve short SHA to full 40-char SHA (GitHub's /git/refs API requires it)
+    if len(head_sha) < 40:
+        try:
+            commit_data = scm._request("GET", f"/repos/{repo}/commits/{head_sha}")
+            head_sha = commit_data["sha"]
+        except Exception as exc:
+            logger.warning("Could not resolve short SHA %s: %s", head_sha, exc)
+
     try:
-        if not scm.branch_exists(repo, remediation_branch):
-            logger.info("Creating remediation branch %s from %s", remediation_branch, sha_short)
-            scm.create_branch(repo, remediation_branch, head_sha)
-        else:
-            logger.info("Reusing existing remediation branch %s", remediation_branch)
+        logger.info("Creating remediation branch %s from %s", remediation_branch, sha_short)
+        scm.create_branch(repo, remediation_branch, head_sha)
     except Exception as exc:
         logger.error("Failed to create/verify remediation branch: %s", exc)
         return None, remediation_branch
@@ -837,27 +851,11 @@ def _create_fix_pr(
     pr_body = "\n".join(pr_body_lines)
 
     try:
-        existing_pr = scm.find_open_pr_by_prefix(repo, head_prefix=REMEDIATION_BRANCH_PREFIX, base=branch)
-        if existing_pr is not None:
-            run_ts = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
-            comment = (
-                f"<!-- unifai-gha-scan-update -->\n\n"
-                f"## UniFAI Re-scan Update — {run_ts}\n\n"
-                f"**{len(committed)} file(s) remediated** in this scan run.\n\n"
-                + files_list
-            )
-            try:
-                scm.post_pr_comment(repo, existing_pr, comment)
-            except Exception as exc:
-                logger.warning("Could not post re-scan comment on PR #%s: %s", existing_pr, exc)
-            logger.info("Updated existing remediation PR #%s", existing_pr)
-            return existing_pr, remediation_branch
-
         pr_number = scm.create_pull_request(repo, title, remediation_branch, branch, pr_body)
         logger.info("Created remediation PR #%d", pr_number)
         return pr_number, remediation_branch
     except Exception as exc:
-        logger.error("Failed to create/update remediation PR: %s", exc)
+        logger.error("Failed to create remediation PR: %s", exc)
         return None, remediation_branch
 
 
@@ -973,7 +971,7 @@ def _execute_scan(args: argparse.Namespace) -> int:
         or os.environ.get("GH_TOKEN", "")
         or os.environ.get("GITHUB_TOKEN", "")
     )
-    if all_violations and github_token and getattr(args, "create_fix_pr", True):
+    if all_violations and github_token and getattr(args, "create_fix_pr", False):
         logger.info(
             "STEP 3: Applying fix_code patches for %d violation(s)", len(all_violations)
         )
@@ -1047,8 +1045,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
              "If not set, violations are reported but no PR is created.",
     )
     parser.add_argument(
-        "--create-fix-pr", default=True, action=argparse.BooleanOptionalAction,
-        help="Create a remediation PR with fix_code patches (default: true). ",
+        "--create-fix-pr", default=False, action="store_true",
+        help="Create a remediation PR with fix_code patches (default: false).",
     )
     parser.add_argument(
         "--debug", action="store_true",
