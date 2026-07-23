@@ -48,8 +48,7 @@ jobs:
             --source-path target-repo \
             --repo "${{ github.event.inputs.source_repo }}" \
             --branch "${{ github.event.inputs.branch }}" \
-            --head-sha "$TARGET_SHA" \
-            --create-fix-pr \
+            --head-sha "$TARGET_SHA"
             | tee scan_result.txt
 
       - name: Publish scan result to job summary
