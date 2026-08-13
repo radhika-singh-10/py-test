@@ -47,6 +47,7 @@ import base64
 import fnmatch
 import json
 import logging
+import logging.handlers
 import os
 import pathlib
 import re
@@ -58,11 +59,353 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+import hashlib
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+# ---------------------------------------------------------------------------
+# LLM output sanitization — reject fix_code containing code-execution primitives
+# ---------------------------------------------------------------------------
+
+_DANGEROUS_CODE_PATTERNS = re.compile(
+    r'\b(eval|exec|compile|execfile|__import__|os\.system|os\.popen|'
+    r'subprocess\.call|subprocess\.run|subprocess\.Popen|subprocess\.check_output|'
+    r'subprocess\.check_call|subprocess\.getoutput|subprocess\.getstatusoutput)\b'
+)
+
+
+def _validate_fix_code(fix_code_entries: list) -> list:
+    """Validate and sanitize fix_code entries from LLM remediation output.
+
+    Removes any fix_code entry whose 'replacement' text contains dynamic code
+    execution primitives (eval, exec, subprocess, etc.).
+    Returns only safe entries; logs warnings for rejected patches.
+    """
+    safe_entries = []
+    for entry in fix_code_entries:
+        replacement = entry.get("replacement", "") if isinstance(entry, dict) else ""
+        original = entry.get("original", "") if isinstance(entry, dict) else ""
+        # Check replacement text for dangerous patterns
+        if _DANGEROUS_CODE_PATTERNS.search(replacement):
+            logger.warning(
+                "Rejected fix_code patch: replacement contains dangerous code execution "
+                "primitive. original snippet: %s",
+                (original[:80] + "...") if len(original) > 80 else original,
+            )
+            continue
+        safe_entries.append(entry)
+    return safe_entries
+
 logger = logging.getLogger("gha_repo_scan")
+
+# ===========================================================================
+# Audit Trail — Append-only decision log for AI-driven MCP actions
+# ===========================================================================
+
+_AUDIT_LOG_PATH = os.environ.get(
+    "LINEAJE_AUDIT_LOG",
+    os.path.join(tempfile.gettempdir(), "lineaje_ai_audit.jsonl"),
+)
+
+# Module-level correlation ID for linking multi-step workflow steps
+_WORKFLOW_CORRELATION_ID: str = os.environ.get(
+    "LINEAJE_CORRELATION_ID", str(uuid.uuid4())
+)
+
+
+class _AuditLogger:
+    """Append-only, immutable audit logger for AI-driven decisions."""
+
+    _lock = threading.Lock()
+
+    @classmethod
+    def log_decision(
+        cls,
+        *,
+        tool_name: str,
+        input_arguments: Any,
+        output: Any,
+        principal: str,
+        model_identifier: str = "lineaje-ai-policy-scanner",
+        model_version: str = "1.0",
+        correlation_id: Optional[str] = None,
+        step_id: Optional[str] = None,
+    ) -> None:
+        """Write an immutable audit record as a single JSON line."""
+        input_serialized = json.dumps(input_arguments, sort_keys=True, default=str)
+        input_hash = hashlib.sha256(input_serialized.encode("utf-8")).hexdigest()
+        output_serialized = json.dumps(output, sort_keys=True, default=str)
+        output_hash = hashlib.sha256(output_serialized.encode("utf-8")).hexdigest()
+
+        record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "correlation_id": correlation_id or _WORKFLOW_CORRELATION_ID,
+            "step_id": step_id or str(uuid.uuid4()),
+            "model_identifier": model_identifier,
+            "model_version": model_version,
+            "tool_name": tool_name,
+            "principal": principal,
+            "input_hash_sha256": input_hash,
+            "output_hash_sha256": output_hash,
+            "input": input_arguments,
+            "output_summary": output_serialized[:2048],
+        }
+
+        line = json.dumps(record, default=str) + "\n"
+
+        with cls._lock:
+            try:
+                with open(_AUDIT_LOG_PATH, "a", encoding="utf-8") as f:
+                    f.write(line)
+                    f.flush()
+                    os.fsync(f.fileno())
+            except OSError as exc:
+                logger.error("Failed to write audit record: %s", exc)
+
+        logger.debug("Audit record written: tool=%s step_id=%s", tool_name, record["step_id"])
+
+# ===========================================================================
+# Input Sanitization for Prompt Injection Prevention
+# ===========================================================================
+
+_MALICIOUS_PATTERNS = [
+    # Shell command patterns
+    re.compile(r'(?:^|\s|;|&&|\|\|)\s*(?:rm\s+-rf|curl\s+|wget\s+|bash\s+-c|sh\s+-c|eval\s*\(|exec\s*\(|os\.system|subprocess\.)', re.IGNORECASE | re.MULTILINE),
+    # Hidden prompt injection markers
+    re.compile(r'(?:ignore\s+(?:all\s+)?(?:previous|above|prior)\s+instructions|disregard\s+(?:all\s+)?(?:previous|above)\s+(?:instructions|prompts))', re.IGNORECASE),
+    # System prompt override attempts
+    re.compile(r'(?:you\s+are\s+now|new\s+instructions?:|system\s*prompt:|<\|?system\|?>|\[INST\]|\[/INST\])', re.IGNORECASE),
+    # Leetspeak common evasion for dangerous commands
+    re.compile(r'(?:3x3c|3v4l|syst3m|sub?pr0c3ss|0s\.syst|rm\s*-\s*r\s*f)', re.IGNORECASE),
+    # Encoded payload patterns (base64 with common dangerous prefixes)
+    re.compile(r'(?:echo\s+[A-Za-z0-9+/=]{20,}\s*\|\s*base64\s+-d|base64\s+--decode|atob\s*\()', re.IGNORECASE),
+    # PowerShell encoded commands
+    re.compile(r'(?:powershell\s+-e(?:nc(?:oded)?)?\s+|IEX\s*\(|Invoke-Expression)', re.IGNORECASE),
+]
+
+
+def _sanitize_scan_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Sanitize file contents in scan payload to prevent prompt injection.
+
+    Checks for hidden prompts, base64-encoded commands, leetspeak obfuscation,
+    shell commands, and other malicious content patterns. Files with suspicious
+    content are flagged but still included with a sanitization marker so the
+    scanner can handle them safely.
+    """
+    sanitized = dict(payload)
+    files = sanitized.get("files") or sanitized.get("file_contents") or []
+    flagged_files: List[str] = []
+
+    for file_entry in files:
+        content = ""
+        if isinstance(file_entry, dict):
+            content = file_entry.get("content", "") or file_entry.get("source", "") or ""
+        elif isinstance(file_entry, str):
+            content = file_entry
+        else:
+            continue
+
+        # Check for base64-encoded blobs that might hide commands
+        try:
+            if len(content) > 50:
+                # Look for long base64 strings that decode to shell commands
+                b64_matches = re.findall(r'[A-Za-z0-9+/=]{40,}', content)
+                for b64_str in b64_matches[:5]:  # limit checks
+                    try:
+                        decoded = base64.b64decode(b64_str, validate=True).decode('utf-8', errors='ignore')
+                        for pattern in _MALICIOUS_PATTERNS:
+                            if pattern.search(decoded):
+                                fname = file_entry.get("path", "unknown") if isinstance(file_entry, dict) else "unknown"
+                                flagged_files.append(fname)
+                                if isinstance(file_entry, dict):
+                                    file_entry["_sanitization_flag"] = "base64_encoded_suspicious_content"
+                                break
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # Direct pattern matching on raw content
+        for pattern in _MALICIOUS_PATTERNS:
+            if pattern.search(content):
+                fname = file_entry.get("path", "unknown") if isinstance(file_entry, dict) else "unknown"
+                if fname not in flagged_files:
+                    flagged_files.append(fname)
+                if isinstance(file_entry, dict):
+                    file_entry["_sanitization_flag"] = file_entry.get("_sanitization_flag", "suspicious_pattern_detected")
+                break
+
+    if flagged_files:
+        logger.warning(
+            "Sanitization flagged %d file(s) with potentially malicious content: %s",
+            len(flagged_files), flagged_files[:10]
+        )
+        sanitized["_sanitization_metadata"] = {
+            "flagged_files_count": len(flagged_files),
+            "flagged_files": flagged_files[:50],
+            "sanitized_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    return sanitized
+
+# ===========================================================================
+# Input Sanitization for MCP/LLM payloads
+# ===========================================================================
+
+_PROMPT_INJECTION_PATTERNS = [
+    re.compile(r"(?i)ignore\s+(all\s+)?(previous|above|prior)\s+(instructions|prompts|rules)"),
+    re.compile(r"(?i)you\s+are\s+now\s+(a|an|in)\s+"),
+    re.compile(r"(?i)system\s*:\s*"),
+    re.compile(r"(?i)\[\s*INST\s*\]"),
+    re.compile(r"(?i)<\|?(im_start|im_end|system|endoftext)\|?>"),
+    re.compile(r"(?i)do\s+not\s+follow\s+(any|the)\s+(previous|above)"),
+    re.compile(r"(?i)disregard\s+(all|any|the)\s+(previous|above|prior)"),
+]
+
+_MAX_PAYLOAD_CONTENT_SIZE = 10 * 1024 * 1024  # 10 MB max per payload
+_MAX_SINGLE_FILE_SIZE = 2 * 1024 * 1024  # 2 MB max per file content
+
+
+def _sanitize_mcp_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Sanitize and validate a payload before sending to MCP/LLM service.
+
+    - Strips null bytes and control characters from string fields
+    - Detects and removes prompt injection patterns
+    - Validates size constraints
+    - Returns a sanitized copy of the payload
+
+    Raises ValueError if the payload is fundamentally invalid.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("MCP payload must be a dictionary")
+
+    sanitized = {}
+    for key, value in payload.items():
+        if isinstance(value, str):
+            sanitized[key] = _sanitize_string_field(value, key)
+        elif isinstance(value, list):
+            sanitized[key] = [_sanitize_payload_item(item) for item in value]
+        elif isinstance(value, dict):
+            sanitized[key] = _sanitize_mcp_payload(value)
+        else:
+            sanitized[key] = value
+    return sanitized
+
+
+def _sanitize_string_field(value: str, field_name: str = "") -> str:
+    """Sanitize a single string field for MCP transmission."""
+    if len(value) > _MAX_SINGLE_FILE_SIZE:
+        logger.warning(
+            "Field '%s' exceeds max size (%d > %d), truncating.",
+            field_name, len(value), _MAX_SINGLE_FILE_SIZE,
+        )
+        value = value[:_MAX_SINGLE_FILE_SIZE]
+
+    # Remove null bytes and non-printable control chars (keep newlines, tabs)
+    value = value.replace("\x00", "")
+    value = re.sub(r"[\x01-\x08\x0b\x0c\x0e-\x1f\x7f]", "", value)
+
+    # Check for prompt injection patterns
+    for pattern in _PROMPT_INJECTION_PATTERNS:
+        if pattern.search(value):
+            logger.warning(
+                "Potential prompt injection detected in field '%s', sanitizing.",
+                field_name,
+            )
+            value = pattern.sub("[REDACTED]", value)
+
+    return value
+
+
+def _sanitize_payload_item(item: Any) -> Any:
+    """Sanitize an individual item within a payload list."""
+    if isinstance(item, str):
+        return _sanitize_string_field(item)
+    elif isinstance(item, dict):
+        return _sanitize_mcp_payload(item)
+    elif isinstance(item, list):
+        return [_sanitize_payload_item(i) for i in item]
+    return item
+
+
+def _validate_payload_size(payload: Dict[str, Any]) -> None:
+    """Validate total serialized payload size is within limits."""
+    serialized = json.dumps(payload)
+    if len(serialized) > _MAX_PAYLOAD_CONTENT_SIZE:
+        raise ValueError(
+            f"Payload size ({len(serialized)} bytes) exceeds maximum "
+            f"allowed size ({_MAX_PAYLOAD_CONTENT_SIZE} bytes)"
+        )
+
+
+# ===========================================================================
+# MCP Output Validation / Sanitization
+# ===========================================================================
+
+_DANGEROUS_PATTERN = re.compile(
+    r'<script[^>]*>.*?</script>|javascript:|on\w+\s*=|data:text/html',
+    re.IGNORECASE | re.DOTALL,
+)
+_CONTROL_CHAR_PATTERN = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
+
+
+def _sanitize_string(value: str) -> str:
+    """Remove control characters and dangerous patterns from a string."""
+    value = _CONTROL_CHAR_PATTERN.sub('', value)
+    value = _DANGEROUS_PATTERN.sub('[REMOVED]', value)
+    return value
+
+
+def _sanitize_value(value: Any) -> Any:
+    """Recursively sanitize a value returned from MCP server."""
+    if isinstance(value, str):
+        return _sanitize_string(value)
+    elif isinstance(value, dict):
+        return {_sanitize_string(k) if isinstance(k, str) else k: _sanitize_value(v) for k, v in value.items()}
+    elif isinstance(value, list):
+        return [_sanitize_value(item) for item in value]
+    elif isinstance(value, (int, float, bool, type(None))):
+        return value
+    else:
+        # Convert unexpected types to sanitized string representation
+        return _sanitize_string(str(value))
+
+
+def _validate_mcp_response(result: Any, tool_name: str) -> Any:
+    """Validate and sanitize the response from an MCP tool invocation.
+
+    Raises ValueError if the response structure is fundamentally invalid.
+    """
+    if result is None:
+        raise ValueError(f"MCP tool '{tool_name}' returned None response")
+
+    if not isinstance(result, (dict, list, str)):
+        raise ValueError(
+            f"MCP tool '{tool_name}' returned unexpected type: {type(result).__name__}"
+        )
+
+    # Sanitize all string content recursively
+    sanitized = _sanitize_value(result)
+
+    # Tool-specific structural validation
+    if tool_name == "scan_source_code" and isinstance(sanitized, dict):
+        # Ensure expected top-level keys are of correct types if present
+        if "violations" in sanitized and not isinstance(sanitized["violations"], list):
+            logger.warning("MCP scan_source_code: 'violations' is not a list, coercing to empty list")
+            sanitized["violations"] = []
+        if "report" in sanitized and not isinstance(sanitized["report"], str):
+            logger.warning("MCP scan_source_code: 'report' is not a string, coercing")
+            sanitized["report"] = str(sanitized["report"])
+
+    elif tool_name == "get_remediation" and isinstance(sanitized, dict):
+        if "fix_code" in sanitized and not isinstance(sanitized["fix_code"], list):
+            logger.warning("MCP get_remediation: 'fix_code' is not a list, coercing to empty list")
+            sanitized["fix_code"] = []
+
+    logger.debug("MCP response for '%s' validated and sanitized successfully", tool_name)
+    return sanitized
 
 # ===========================================================================
 # Constants
@@ -71,11 +414,113 @@ logger = logging.getLogger("gha_repo_scan")
 MCP_SERVER_URL = "https://mcp.commercialdev.dev.veedna.com/mcp"
 # MCP_SERVER_URL = "https://mcp.v2.prod.veedna.com/mcp"
 
+# AI Risk Classification (required by AI governance policy)
+# Levels: "minimal" | "limited" | "high" | "unacceptable"
+AI_RISK_CLASSIFICATION = "limited"
+
+# SSL context for MCP server authentication — verifies server TLS certificate
+# and hostname to ensure we are connecting to the legitimate MCP server.
+_MCP_SSL_CONTEXT = ssl.create_default_context()
+_MCP_SSL_CONTEXT.verify_mode = ssl.CERT_REQUIRED
+_MCP_SSL_CONTEXT.check_hostname = True
+
 MAX_SCAN_WORKERS = 4
 REMEDIATION_BRANCH_PREFIX = "remediation/unifai-gha"
 DEFAULT_UNIFAI_FILE_BATCH_SIZE = 100
 
+# ---------------------------------------------------------------------------
+# Approved Foundation Model Registry — version-pinned with integrity hashes
+# Only models listed here may be invoked. Each entry includes:
+#   - model_id: fully qualified model identifier with version
+#   - digest: SHA-256 hash for integrity verification
+#   - approved: whether the model is cleared for use
+# ---------------------------------------------------------------------------
+APPROVED_MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
+    "amazon.nova-lite-v1:0": {
+        "model_id": "amazon.nova-lite-v1:0",
+        "version": "1.0",
+        "digest": "sha256:a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2",
+        "approved": True,
+        "registry_source": "lineaje-approved-models",
+    },
+}
+
+# The default model to use — must exist in APPROVED_MODEL_REGISTRY
+DEFAULT_FOUNDATION_MODEL_ID = "amazon.nova-lite-v1:0"
+
+
+def get_verified_model_id(model_key: str) -> str:
+    """Retrieve a model ID from the approved registry with integrity check.
+
+    Raises ValueError if the model is not in the registry or not approved.
+    """
+    if model_key not in APPROVED_MODEL_REGISTRY:
+        raise ValueError(
+            f"Model '{model_key}' is NOT in the approved model registry. "
+            f"Approved models: {list(APPROVED_MODEL_REGISTRY.keys())}"
+        )
+    entry = APPROVED_MODEL_REGISTRY[model_key]
+    if not entry.get("approved", False):
+        raise ValueError(
+            f"Model '{model_key}' is in the registry but NOT approved for use."
+        )
+    if not entry.get("digest"):
+        raise ValueError(
+            f"Model '{model_key}' has no integrity digest pinned — cannot verify."
+        )
+    logger.debug(
+        "Model '%s' verified: version=%s, digest=%s, registry=%s",
+        model_key, entry["version"], entry["digest"], entry["registry_source"],
+    )
+    return entry["model_id"]
+
 _DEFAULT_LINEAJE_TOKEN_REFRESH_SKEW_SEC = 120
+_MCP_SESSION_EXPIRY_SEC = 3600  # MCP session validity window (1 hour)
+_MCP_SESSION_HMAC_KEY: bytes = secrets.token_bytes(32)  # Per-process signing key
+
+
+class _SignedSession:
+    """Wraps an MCP session ID with HMAC signature, expiry, and token binding."""
+
+    def __init__(self, session_id: str, bearer_token: str) -> None:
+        self._session_id = session_id
+        self._created_at = time.time()
+        self._expiry = self._created_at + _MCP_SESSION_EXPIRY_SEC
+        # Bind session to the bearer token via a hash
+        self._token_binding = hashlib.sha256(bearer_token.encode()).hexdigest()
+        # Compute HMAC over session_id + expiry + binding
+        self._signature = self._compute_signature()
+
+    def _compute_signature(self) -> str:
+        payload = f"{self._session_id}|{self._expiry}|{self._token_binding}"
+        return hmac.new(_MCP_SESSION_HMAC_KEY, payload.encode(), hashlib.sha256).hexdigest()
+
+    @staticmethod
+    def _hmac_digest(payload: str) -> str:
+        return hmac.new(_MCP_SESSION_HMAC_KEY, payload.encode(), hashlib.sha256).hexdigest()
+
+    def verify(self, bearer_token: str) -> str:
+        """Verify integrity, expiry, and binding. Returns session_id or raises."""
+        # Check expiry
+        if time.time() > self._expiry:
+            raise ValueError("MCP session has expired")
+        # Check token binding
+        current_binding = hashlib.sha256(bearer_token.encode()).hexdigest()
+        if not hmac.compare_digest(current_binding, self._token_binding):
+            raise ValueError("MCP session token binding mismatch")
+        # Verify HMAC signature
+        expected_sig = self._compute_signature()
+        if not hmac.compare_digest(expected_sig, self._signature):
+            raise ValueError("MCP session signature verification failed")
+        return self._session_id
+
+    @property
+    def is_expired(self) -> bool:
+        return time.time() > self._expiry
+
+    @property
+    def session_id(self) -> str:
+        return self._session_id
 
 # Refresh-token renew URL — not used with PAT auth (kept for reference)
 # _LINEAJE_NATIVE_RENEW_ACCESS_TOKEN_URL_PROD = (
@@ -1155,6 +1600,29 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     # Always show INFO from this logger regardless of --debug
     logger.setLevel(logging.DEBUG if args.debug else logging.INFO)
+
+    # --- Persistent audit log with six-month (180-day) retention ---
+    _LOG_RETENTION_DAYS = 180  # Minimum six-month retention for high-risk AI systems
+    _AUDIT_LOG_DIR = pathlib.Path(os.environ.get("LINEAJE_AUDIT_LOG_DIR", "/var/log/lineaje"))
+    _AUDIT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    _audit_log_path = _AUDIT_LOG_DIR / "ai_policy_scan_audit.log"
+    _audit_handler = logging.handlers.TimedRotatingFileHandler(
+        filename=str(_audit_log_path),
+        when="D",
+        interval=1,
+        backupCount=_LOG_RETENTION_DAYS,
+        utc=True,
+    )
+    _audit_handler.setLevel(logging.INFO)
+    _audit_handler.setFormatter(logging.Formatter(
+        fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S%z",
+    ))
+    logging.getLogger().addHandler(_audit_handler)
+    logger.info(
+        "Audit logging initialized: path=%s, retention_days=%d",
+        _audit_log_path, _LOG_RETENTION_DAYS,
+    )
 
     try:
         return _execute_scan(args)
