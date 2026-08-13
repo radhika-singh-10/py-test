@@ -54,6 +54,7 @@ import sys
 import tempfile
 import threading
 import time
+import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -884,6 +885,8 @@ def _execute_scan(args: argparse.Namespace) -> int:
     source_path = os.path.abspath(args.source_path)
     server_url = args.mcp_server_url or os.environ.get("MCP_SERVER_URL", "") or MCP_SERVER_URL
     source_code_repo = f"https://github.com/{repo}.git" if repo else source_path
+    if not head_sha:
+         head_sha = _resolve_head_sha_from_source(source_path)
 
     # Validate config
     missing = [n for n, v in [("GITHUB_REPOSITORY / --repo", repo), ("GITHUB_REF_NAME / --branch", branch)] if not v]
