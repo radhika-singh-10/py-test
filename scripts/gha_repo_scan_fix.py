@@ -790,6 +790,13 @@ def _create_fix_pr(
     if not validated_fixes:
         return None, ""
 
+    if not head_sha:
+        logger.error(
+            "Cannot create remediation branch: head_sha is empty. "
+            "Pass --head-sha or ensure $GITHUB_SHA is set in the environment."
+        )
+        return None, ""
+
     safe_branch = re.sub(r"[^a-zA-Z0-9._/-]", "-", branch)
     sha_short = head_sha[:7]
     timestamp = time.strftime("%m%d%H%M")
