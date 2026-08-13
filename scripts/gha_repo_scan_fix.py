@@ -54,7 +54,6 @@ import sys
 import tempfile
 import threading
 import time
-import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -69,8 +68,8 @@ logger = logging.getLogger("gha_repo_scan")
 # Constants
 # ===========================================================================
 
-MCP_SERVER_URL = "https://mcp.v2.prod.veedna.com/mcp"
-# MCP_SERVER_URL = "https://mcp.commercialdev.dev.veedna.com/mcp"
+# MCP_SERVER_URL = "https://mcp.v2.prod.veedna.com/mcp"
+MCP_SERVER_URL = "https://mcp.commercialdev.dev.veedna.com/mcp"
 
 MAX_SCAN_WORKERS = 4
 REMEDIATION_BRANCH_PREFIX = "remediation/unifai-gha"
@@ -78,7 +77,7 @@ DEFAULT_UNIFAI_FILE_BATCH_SIZE = 100
 
 _DEFAULT_LINEAJE_TOKEN_REFRESH_SKEW_SEC = 120
 _LINEAJE_NATIVE_RENEW_ACCESS_TOKEN_URL_PROD = (
-   "https://lineaje-identity-service.v2.prod.veedna.com"
+    "https://lineaje-identity-service.commercialdev.dev.veedna.com"
     "/lineajeidentity/api/v1/auth/native/renew-access-token"
 )
 #  "https://lineaje-identity-service.v2.prod.veedna.com"
@@ -791,13 +790,6 @@ def _create_fix_pr(
     if not validated_fixes:
         return None, ""
 
-    if not head_sha:
-        logger.error(
-            "Cannot create remediation branch: head_sha is empty. "
-            "Pass --head-sha or ensure $GITHUB_SHA is set in the environment."
-        )
-        return None, ""
-
     safe_branch = re.sub(r"[^a-zA-Z0-9._/-]", "-", branch)
     sha_short = head_sha[:7]
     timestamp = time.strftime("%m%d%H%M")
@@ -885,8 +877,6 @@ def _execute_scan(args: argparse.Namespace) -> int:
     source_path = os.path.abspath(args.source_path)
     server_url = args.mcp_server_url or os.environ.get("MCP_SERVER_URL", "") or MCP_SERVER_URL
     source_code_repo = f"https://github.com/{repo}.git" if repo else source_path
-    if not head_sha:
-         head_sha = _resolve_head_sha_from_source(source_path)
 
     # Validate config
     missing = [n for n, v in [("GITHUB_REPOSITORY / --repo", repo), ("GITHUB_REF_NAME / --branch", branch)] if not v]
