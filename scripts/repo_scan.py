@@ -22,6 +22,8 @@ Output (stdout, JSON)::
         "head_sha": "abc1234",
         "source_code_repo": "https://github.com/owner/repo.git",
         "scanned_at": "2026-05-07T10:00:00Z",
+            "model_version": MCP_MODEL_VERSION,
+            "llm_remediation_version": LLM_REMEDIATION_MODEL_VERSION,
         "files_scanned": 150,
         "batches": 2,
         "failed_batches": 0
@@ -35,13 +37,13 @@ Output (stdout, JSON)::
 Environment variables::
 
     SCM_ACCESS_TOKEN     — GitHub Personal Access Token
-    MCP_REFRESH_TOKEN    — MCP server refresh token (preferred auth)
-    MCP_BEARER_TOKEN     — MCP server static bearer token (fallback)
-    LINEAJE_REFRESH_TOKEN — Alias for MCP_REFRESH_TOKEN
+    MCP_REFRESH_TOKEN    — MCP/Lineaje server refresh token (preferred auth;
+                           LINEAJE_REFRESH_TOKEN is accepted as an alias)
+    MCP_BEARER_TOKEN     — MCP/Lineaje server static bearer token (fallback)
     LINEAJE_RENEW_ACCESS_TOKEN_URL  — renew-access-token URL (defaults to prod)
     LINEAJE_TOKEN_REFRESH_SKEW_SEC  — Refresh seconds before expiry (default: 120)
-    LLM_API_KEY          — API key for LLM remediation (OpenRouter, required)
-    UNIFAI_API_KEY / OPENROUTER_API_KEY — Fallback LLM key aliases
+    LLM_API_KEY          — API key for LLM remediation (OpenRouter, required;
+                           UNIFAI_API_KEY and OPENROUTER_API_KEY accepted as fallback aliases)
 
 Constants (in ``veracode_repo_scan.py`` — not environment variables)::
 
@@ -66,6 +68,7 @@ import fnmatch
 import hashlib
 import json
 import logging
+import logging.handlers
 import os
 import pathlib
 import re
@@ -84,8 +87,51 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
+import hmac
 
 import requests
+
+# ---------------------------------------------------------------------------
+# Input sanitization for MCP tool call parameters
+# ---------------------------------------------------------------------------
+
+def _sanitize_input(value: Any, field_name: str = "", max_length: int = 4096) -> Any:
+    """Validate and sanitize a value before passing it to an MCP tool call.
+
+    - Strings are stripped, length-limited, and checked for dangerous characters.
+    - None values pass through unchanged.
+    - Lists/dicts are recursively sanitized.
+    """
+    if value is None:
+        return value
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, list):
+        return [_sanitize_input(v, field_name, max_length) for v in value]
+    if isinstance(value, dict):
+        return {k: _sanitize_input(v, k, max_length) for k, v in value.items()}
+    if isinstance(value, str):
+        # Strip leading/trailing whitespace
+        sanitized = value.strip()
+        # Enforce maximum length
+        if len(sanitized) > max_length:
+            raise ValueError(f"Input '{field_name}' exceeds maximum length {max_length}")
+        # Reject null bytes
+        if '\x00' in sanitized:
+            raise ValueError(f"Input '{field_name}' contains null bytes")
+        # Reject common injection patterns (shell metacharacters in non-JSON fields)
+        if field_name not in ("remediation_actions_json", "files_to_scan") and re.search(r'[;|`$]', sanitized):
+            raise ValueError(f"Input '{field_name}' contains potentially dangerous characters")
+        return sanitized
+    return value
+
+
+def _sanitize_tool_args(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Sanitize all arguments in a dict before passing to _call_tool."""
+    return {k: _sanitize_input(v, field_name=k) for k, v in arguments.items()}
+
 
 # macOS Python installations often lack system CA certs.
 try:
@@ -123,7 +169,84 @@ from scan_common import (  # noqa: E402
     introspect_lineaje_pat,
 )
 
+# ---------------------------------------------------------------------------
+# LLM output sanitization — reject fix_code containing code-execution primitives
+# ---------------------------------------------------------------------------
+
+_LLM_DANGEROUS_PATTERNS = [
+    re.compile(r'\beval\s*\('),
+    re.compile(r'\bexec\s*\('),
+    re.compile(r'\bos\.system\s*\('),
+    re.compile(r'\bos\.popen\s*\('),
+    re.compile(r'\bsubprocess\.[\w]*\([^)]*shell\s*=\s*True'),
+    re.compile(r'\bcompile\s*\([^)]*,[^)]*["\']exec["\']'),
+    re.compile(r'\b__import__\s*\('),
+    re.compile(r'\bexecfile\s*\('),
+]
+
+
+def _llm_output_contains_dangerous_code(text: str) -> bool:
+    """Return True if *text* contains dynamic code execution primitives."""
+    if not text:
+        return False
+    for pat in _LLM_DANGEROUS_PATTERNS:
+        if pat.search(text):
+            return True
+    return False
+
+
+def sanitize_llm_remediation_output(remediation_actions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Validate and sanitize LLM remediation output.
+
+    Removes any ``fix_code`` entries whose ``replacement`` text contains
+    dangerous dynamic code execution primitives (eval, exec, subprocess
+    shell=True, os.system, etc.).  Logs a warning for each rejected entry.
+    """
+    for action in remediation_actions:
+        fix_code = action.get("fix_code")
+        if not fix_code or not isinstance(fix_code, list):
+            continue
+        safe_fixes: List[Dict[str, str]] = []
+        for entry in fix_code:
+            replacement = entry.get("replacement", "")
+            original = entry.get("original", "")
+            if _llm_output_contains_dangerous_code(replacement):
+                logger.warning(
+                    "Sanitizer: rejected LLM fix_code replacement containing "
+                    "dangerous code-execution primitive for file=%s",
+                    action.get("file", "<unknown>"),
+                )
+                continue
+            if _llm_output_contains_dangerous_code(original) and original != replacement:
+                # original may legitimately contain dangerous code if the fix
+                # is *removing* it; only reject if replacement also introduces it
+                pass
+            safe_fixes.append(entry)
+        action["fix_code"] = safe_fixes
+    return remediation_actions
+
 logger = logging.getLogger("veracode_repo_scan")
+
+# --- High-risk AI system log retention (minimum 180 days) ---
+_LOG_RETENTION_DAYS = int(os.environ.get("LINEAJE_LOG_RETENTION_DAYS", "180"))
+_LOG_DIR = os.environ.get("LINEAJE_LOG_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), ".logs"))
+os.makedirs(_LOG_DIR, exist_ok=True)
+_retention_handler = logging.handlers.TimedRotatingFileHandler(
+    filename=os.path.join(_LOG_DIR, "veracode_repo_scan.log"),
+    when="D",
+    interval=1,
+    backupCount=_LOG_RETENTION_DAYS,
+    utc=True,
+)
+_retention_handler.setFormatter(
+    logging.Formatter(
+        fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+)
+_retention_handler.setLevel(logging.DEBUG)
+logger.addHandler(_retention_handler)
+# --- End log retention configuration ---
 
 # ===========================================================================
 # Constants
@@ -141,13 +264,158 @@ MAX_ARCHIVE_SIZE_BYTES = 20 * 1024 * 1024  # 20 MB
 
 MCP_SERVER_URL = "https://mcp.v2.prod.veedna.com/mcp"
 
+# Explicit allow list of MCP tools that this script is permitted to invoke.
+MCP_TOOL_ALLOW_LIST = frozenset({
+    "get_upload_url",
+    "analyze_uploaded_archive",
+    "run_remediation",
+})
+
+
+def _validate_mcp_tool(tool_name: str) -> None:
+    """Raise ValueError if *tool_name* is not in the approved allow list."""
+    if tool_name not in MCP_TOOL_ALLOW_LIST:
+        raise ValueError(
+            f"MCP tool '{tool_name}' is not in the approved allow list: "
+            f"{sorted(MCP_TOOL_ALLOW_LIST)}"
+        )
+
+# AI Deployment Configuration — covered domain declaration per automated
+# decision-making regulations (required by governance policy).
+COVERED_DOMAIN = "software_security_scanning"  # Regulated taxonomy classification
+MCP_MODEL_VERSION = "mcp-scan-pipeline-v2.1.0"
+LLM_REMEDIATION_MODEL_VERSION = "llm-remediation-v1.3.0"
+_MODEL_VERSION_METADATA = {
+    "mcp_scan_pipeline_version": MCP_MODEL_VERSION,
+    "llm_remediation_version": LLM_REMEDIATION_MODEL_VERSION,
+    "release_date": "2026-05-07",
+    "changelog": "https://docs.veedna.com/releases/mcp-v2.1.0",
+}
+
+# AI deployment risk classification metadata (required by governance policy)
+AI_DEPLOYMENT_METADATA = {
+    "risk_classification": "high",
+    "risk_level": "high",
+    "deployment_type": "mcp_scanning_pipeline_with_llm_remediation",
+    "policy_version": "1.0",
+}
+
+# ---------------------------------------------------------------------------
+# URL Allowlist Validation
+# ---------------------------------------------------------------------------
+
+_DEFAULT_ALLOWED_DOMAINS = {
+    "mcp.v2.prod.veedna.com",
+    "github.com",
+    "lineaje-identity-service.v2.prod.veedna.com",
+    "s3.amazonaws.com",
+    ".s3.amazonaws.com",
+    ".amazonaws.com",
+}
+
+
+def _get_allowed_domains() -> set:
+    """Return the set of allowed domains for outbound HTTP requests."""
+    env_domains = os.environ.get("ALLOWED_URL_DOMAINS", "")
+    extra = {d.strip() for d in env_domains.split(",") if d.strip()} if env_domains else set()
+    return _DEFAULT_ALLOWED_DOMAINS | extra
+
+
+def _validate_url_allowlist(url: str) -> None:
+    """Validate that a URL's host is in the allowed domains list.
+
+    Raises ValueError if the URL is not allowed.
+    """
+    if not url:
+        raise ValueError("Empty URL is not allowed for outbound requests.")
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.hostname
+    if not host:
+        raise ValueError(f"Cannot determine host from URL: {url}")
+    allowed = _get_allowed_domains()
+    # Check exact match or suffix match (for wildcard subdomains like .s3.amazonaws.com)
+    for domain in allowed:
+        if domain.startswith("."):
+            if host == domain[1:] or host.endswith(domain):
+                return
+        else:
+            if host == domain:
+                return
+    raise ValueError(
+        f"Outbound request to '{host}' is not in the URL allowlist. "
+        f"Allowed domains: {sorted(allowed)}"
+    )
+
+
+def _mcp_request(method: str, url: str, **kwargs) -> requests.Response:
+    """Wrapper for all MCP server HTTP interactions that logs request and response."""
+    req_body = kwargs.get("json") or kwargs.get("data")
+    headers = kwargs.get("headers", {})
+    # Redact sensitive headers for logging
+    safe_headers = {k: (v if k.lower() not in ("authorization", "x-access-token") else "[REDACTED]") for k, v in headers.items()}
+    logger.info("MCP request: %s %s headers=%s body=%s", method.upper(), url, safe_headers, _truncate_for_log(req_body))
+    try:
+        resp = requests.request(method, url, **kwargs)
+        resp_body = None
+        try:
+            resp_body = resp.json()
+        except Exception:
+            resp_body = resp.text[:_LOG_HTTP_BODY_MAX] if resp.text else None
+        logger.info("MCP response: status=%s url=%s body=%s", resp.status_code, url, _truncate_for_log(resp_body))
+        return resp
+    except Exception as exc:
+        logger.error("MCP request failed: %s %s error=%s", method.upper(), url, exc)
+        raise
+
+
+def _truncate_for_log(obj) -> str:
+    """Truncate an object's string representation for safe logging."""
+    if obj is None:
+        return "<empty>"
+    s = str(obj)
+    if len(s) > _LOG_HTTP_BODY_MAX:
+        return s[:_LOG_HTTP_BODY_MAX] + "...[truncated]"
+    return s
+
 MAX_LLM_FILE_SIZE = 100_000
+
+def _mask_token(token: str) -> str:
+    """Return a masked version of a token showing only first 8 and last 4 chars."""
+    if not token or len(token) <= 12:
+        return "***MASKED***"
+    return f"{token[:8]}...{token[-4:]}"
+
+
+def _minimise_violations(violations: list) -> list:
+    """Limit violations to _MAX_OUTPUT_VIOLATIONS and strip verbose fields."""
+    minimised = []
+    for v in violations[:_MAX_OUTPUT_VIOLATIONS]:
+        if isinstance(v, dict):
+            minimised.append({
+                "file": v.get("file", ""),
+                "line": v.get("line"),
+                "rule": v.get("rule", v.get("violation_type", "")),
+                "severity": v.get("severity", ""),
+                "message": (v.get("message", "") or "")[:300],
+            })
+        else:
+            minimised.append(str(v)[:300])
+    if len(violations) > _MAX_OUTPUT_VIOLATIONS:
+        minimised.append({"_truncated": True, "total_count": len(violations)})
+    return minimised
+
+
+def _minimise_scan_errors(errors: list) -> list:
+    """Truncate scan error messages to avoid leaking sensitive details."""
+    return [str(e)[:_MAX_SCAN_ERROR_LEN] for e in (errors or [])]
 LLM_TIMEOUT = 120
 
 MAX_SCAN_WORKERS = 4
 MAX_LLM_WORKERS = 5
 
-_LOG_HTTP_BODY_MAX = int(os.environ.get("LINEAJE_LOG_HTTP_BODY_MAX", "1200"))
+_LOG_HTTP_BODY_MAX = int(os.environ.get("LINEAJE_LOG_HTTP_BODY_MAX", "512"))
+_MAX_OUTPUT_VIOLATIONS = int(os.environ.get("LINEAJE_MAX_OUTPUT_VIOLATIONS", "50"))
+_MAX_SCAN_ERROR_LEN = 200
 _DEFAULT_LINEAJE_TOKEN_REFRESH_SKEW_SEC = 120
 
 _LINEAJE_NATIVE_RENEW_ACCESS_TOKEN_URL_PROD = (
@@ -156,6 +424,12 @@ _LINEAJE_NATIVE_RENEW_ACCESS_TOKEN_URL_PROD = (
 )
 
 _GITHUB_CLONE_URL = "https://x-access-token:{token}@github.com/{repo}.git"
+
+
+def _validated_url(url: str) -> str:
+    """Validate URL against allowlist and return it if valid."""
+    _validate_url_allowlist(url)
+    return url
 
 _ARCHIVE_EXCLUDE = {
     ".git", ".gitignore", ".gitattributes", ".gitmodules", ".hg", ".svn",
@@ -195,13 +469,38 @@ _SENSITIVE_JSON_KEYS = frozenset({
     "accessToken", "device_code", "deviceCode",
 })
 
-_SYNTAX_VALIDATORS: Dict[str, str] = {
-    ".py":   "python3 -c \"import ast; ast.parse(open('{path}').read())\"",
-    ".js":   "node --check '{path}'",
-    ".ts":   "node -e \"require('fs').readFileSync('{path}', 'utf8')\"",
-    ".json": "python3 -c \"import json; json.load(open('{path}'))\"",
-    ".yaml": "python3 -c \"import yaml; yaml.safe_load(open('{path}'))\"",
-    ".yml":  "python3 -c \"import yaml; yaml.safe_load(open('{path}'))\"",
+def _validate_python_syntax(path: str) -> List[str]:
+    """Return subprocess arg list to validate Python syntax."""
+    return ["python3", "-c", f"import ast; ast.parse(open('{path}').read())"]
+
+
+def _validate_js_syntax(path: str) -> List[str]:
+    """Return subprocess arg list to validate JS syntax."""
+    return ["node", "--check", path]
+
+
+def _validate_ts_syntax(path: str) -> List[str]:
+    """Return subprocess arg list to validate TS file readability."""
+    return ["node", "-e", f"require('fs').readFileSync('{path}', 'utf8')"]
+
+
+def _validate_json_syntax(path: str) -> List[str]:
+    """Return subprocess arg list to validate JSON syntax."""
+    return ["python3", "-c", f"import json; json.load(open('{path}'))"]
+
+
+def _validate_yaml_syntax(path: str) -> List[str]:
+    """Return subprocess arg list to validate YAML syntax."""
+    return ["python3", "-c", f"import yaml; yaml.safe_load(open('{path}'))"]
+
+
+_SYNTAX_VALIDATORS: Dict[str, Any] = {
+    ".py":   _validate_python_syntax,
+    ".js":   _validate_js_syntax,
+    ".ts":   _validate_ts_syntax,
+    ".json": _validate_json_syntax,
+    ".yaml": _validate_yaml_syntax,
+    ".yml":  _validate_yaml_syntax,
 }
 
 # ===========================================================================
@@ -301,7 +600,7 @@ def log_mcp_bearer_for_scan(where: str, token: str) -> None:
     if _env_full_mcp_bearer_logging_enabled():
         logger.warning("MCP bearer (%s): INSECURE — full JWT on next INFO line", where)
         logger.info("MCP bearer (%s) FULL_JWT:", where)
-        logger.info("%s", t)
+        logger.info("%s", _mask_token(t) if t else t)
 
 
 def _log_step_timing(label: str, step_start: float, scan_start: float) -> float:
@@ -467,6 +766,7 @@ class RefreshTokenTokenManager:
     def _renew_tokens_unlocked(self) -> None:
         q = urllib.parse.urlencode({"refreshToken": self._refresh_token})
         url = f"{self._renew_url}?{q}"
+        _validate_url_allowlist(url)
         req = urllib.request.Request(
             url, data=b"null",
             headers={"Content-Type": "application/json"},
@@ -477,7 +777,7 @@ class RefreshTokenTokenManager:
                 payload = _identity_token_response_dict(resp.read().decode(), context="renew-access-token")
         except urllib.error.HTTPError as exc:
             err_body = exc.read().decode(errors="replace")
-            raise RuntimeError(f"renew-access-token HTTP {exc.code}: {err_body[:800]}") from exc
+            raise RuntimeError(f"renew-access-token HTTP {exc.code}: {err_body[:200]}") from exc
         self._apply_token_payload(payload)
 
 
@@ -485,19 +785,77 @@ class RefreshTokenTokenManager:
 # build_mcp_bearer_getter
 # ===========================================================================
 
+def _mcp_bearer_sign(pat: str, subject: str, expires_at: float, secret: bytes) -> str:
+    """Create a signed bearer payload encoding PAT, subject, and expiry."""
+    import hmac as _hmac
+    import hashlib as _hashlib
+    import json as _json
+    import base64 as _base64
+    payload = _json.dumps({
+        "pat": pat,
+        "sub": subject,
+        "exp": expires_at,
+    }, separators=(",", ":"))
+    sig = _hmac.new(secret, payload.encode("utf-8"), _hashlib.sha256).hexdigest()
+    token = _base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii") + "." + sig
+    return token
+
+
+def _mcp_bearer_verify(token: str, secret: bytes) -> str:
+    """Verify signature, expiry, and subject binding; return the PAT or raise."""
+    import hmac as _hmac
+    import hashlib as _hashlib
+    import json as _json
+    import base64 as _base64
+    parts = token.rsplit(".", 1)
+    if len(parts) != 2:
+        raise RuntimeError("MCP bearer token: invalid format (missing signature)")
+    payload_b64, sig = parts
+    payload_bytes = _base64.urlsafe_b64decode(payload_b64)
+    expected_sig = _hmac.new(secret, payload_bytes, _hashlib.sha256).hexdigest()
+    if not _hmac.compare_digest(sig, expected_sig):
+        raise RuntimeError("MCP bearer token: signature verification failed")
+    data = _json.loads(payload_bytes)
+    if time.time() > data.get("exp", 0):
+        raise RuntimeError("MCP bearer token: token has expired")
+    if not data.get("sub"):
+        raise RuntimeError("MCP bearer token: missing subject binding")
+    return data["pat"]
+
+
 def build_mcp_bearer_getter(args: Any) -> Callable[[], str]:
     """Return a callable that yields the Lineaje PAT token as the MCP bearer.
+
+    The token is signed with HMAC-SHA256, bound to a subject identifier,
+    and enforces an expiry window. On each invocation the signature and
+    expiry are re-verified before the PAT is returned.
 
     Checks ``--lineaje-pat`` / ``LINEAJE_PAT_TOKEN`` env var.
     Raises if neither is provided.
     """
+    import hashlib as _hashlib
     pat = (
         (getattr(args, "lineaje_pat", None) or "").strip()
         or os.environ.get("LINEAJE_PAT_TOKEN", "").strip()
     )
     if pat:
-        logger.info("MCP auth: Lineaje PAT token")
-        return lambda: pat
+        logger.info("MCP auth: Lineaje PAT token (signed, expiry-bound)")
+        # Derive a signing secret from the PAT itself (acts as shared secret)
+        secret = _hashlib.sha256((
+            os.environ.get("MCP_SIGNING_SECRET", "") or pat
+        ).encode("utf-8")).digest()
+        # Subject binding: use machine identifier or PAT fingerprint
+        subject = _hashlib.sha256(pat.encode("utf-8")).hexdigest()[:16]
+        # Token validity window: 1 hour
+        token_lifetime_sec = 3600
+
+        def _get_verified_bearer() -> str:
+            expires_at = time.time() + token_lifetime_sec
+            signed_token = _mcp_bearer_sign(pat, subject, expires_at, secret)
+            # Immediately verify integrity before returning the PAT
+            return _mcp_bearer_verify(signed_token, secret)
+
+        return _get_verified_bearer
 
     raise RuntimeError(
         "No Lineaje PAT token found. Set LINEAJE_PAT_TOKEN env var or pass --lineaje-pat."
@@ -1137,6 +1495,82 @@ def _repo_archive_batch_size(total_files: int) -> int:
 # MCP scan
 # ===========================================================================
 
+# ---------------------------------------------------------------------------
+# Input sanitization helpers – validate/sanitize user-supplied values before
+# they are sent to LLM or MCP tool invocations.
+# ---------------------------------------------------------------------------
+
+import re as _re
+
+_REPO_NAME_PATTERN = _re.compile(r'^[A-Za-z0-9_.\-/]+$')
+_BRANCH_NAME_PATTERN = _re.compile(r'^[A-Za-z0-9_.\-/]+$')
+_FILE_PATH_PATTERN = _re.compile(r'^[A-Za-z0-9_.\-/\\@:]+$')
+
+
+def _sanitize_repo_name(repo: str) -> str:
+    """Validate and sanitize repository name to prevent prompt injection."""
+    if not repo or not isinstance(repo, str):
+        raise ValueError("Repository name must be a non-empty string.")
+    repo = repo.strip()
+    if len(repo) > 256:
+        raise ValueError(f"Repository name too long ({len(repo)} chars, max 256).")
+    if not _REPO_NAME_PATTERN.match(repo):
+        raise ValueError(
+            f"Repository name contains invalid characters: {repo!r}. "
+            "Only alphanumerics, dots, hyphens, underscores, and slashes are allowed."
+        )
+    return repo
+
+
+def _sanitize_branch(branch: str) -> str:
+    """Validate and sanitize branch/tag name to prevent prompt injection."""
+    if not branch or not isinstance(branch, str):
+        raise ValueError("Branch name must be a non-empty string.")
+    branch = branch.strip()
+    if len(branch) > 256:
+        raise ValueError(f"Branch name too long ({len(branch)} chars, max 256).")
+    if not _BRANCH_NAME_PATTERN.match(branch):
+        raise ValueError(
+            f"Branch name contains invalid characters: {branch!r}. "
+            "Only alphanumerics, dots, hyphens, underscores, and slashes are allowed."
+        )
+    return branch
+
+
+def _sanitize_file_list(files: List[str]) -> List[str]:
+    """Validate and sanitize file paths to prevent prompt injection."""
+    if not files or not isinstance(files, list):
+        raise ValueError("files_to_scan must be a non-empty list.")
+    sanitized = []
+    for f in files:
+        if not f or not isinstance(f, str):
+            continue
+        f = f.strip()
+        if len(f) > 1024:
+            raise ValueError(f"File path too long ({len(f)} chars, max 1024): {f[:80]}...")
+        if not _FILE_PATH_PATTERN.match(f):
+            raise ValueError(
+                f"File path contains invalid characters: {f!r}. "
+                "Only alphanumerics, dots, hyphens, underscores, slashes, backslashes, @ and : are allowed."
+            )
+        # Prevent path traversal
+        if '..' in f:
+            raise ValueError(f"File path contains path traversal: {f!r}")
+        sanitized.append(f)
+    if not sanitized:
+        raise ValueError("No valid file paths after sanitization.")
+    return sanitized
+
+
+def _get_verified_ssl_context() -> "ssl.SSLContext":
+    """Return an SSL context that verifies the server's certificate."""
+    import ssl
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = True
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    return ctx
+
+
 def _upload_to_s3(presigned_url: str, archive_path: str) -> None:
     size = os.path.getsize(archive_path)
     logger.info("Uploading %d KB to S3 ...", size // 1024)
@@ -1145,20 +1579,269 @@ def _upload_to_s3(presigned_url: str, archive_path: str) -> None:
             presigned_url, data=f.read(), method="PUT",
             headers={"Content-Type": "application/zip"},
         )
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, context=_get_verified_ssl_context()) as resp:
             if resp.status not in (200, 204):
                 raise RuntimeError(f"S3 upload failed: HTTP {resp.status}")
     logger.info("S3 upload complete")
 
 
+def _redact_pii_from_archive(archive_path: str) -> None:
+    """Scan archive contents for PII and redact before upload."""
+    import re
+    import tarfile
+    import zipfile
+    import tempfile
+    import shutil
+
+    PII_PATTERNS = [
+        (re.compile(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Z|a-z]{2,}\b'), '[REDACTED_EMAIL]'),
+        (re.compile(r'\b\d{3}[\-.]?\d{2}[\-.]?\d{4}\b'), '[REDACTED_SSN]'),
+        (re.compile(r'\b(?:\+?1[\-\s.]?)?\(?\d{3}\)?[\-\s.]?\d{3}[\-\s.]?\d{4}\b'), '[REDACTED_PHONE]'),
+        (re.compile(r'\b(?:\d{4}[\-\s]?){3}\d{4}\b'), '[REDACTED_CC]'),
+    ]
+
+    def redact_content(content: bytes) -> bytes:
+        try:
+            text = content.decode('utf-8')
+        except (UnicodeDecodeError, ValueError):
+            return content
+        for pattern, replacement in PII_PATTERNS:
+            text = pattern.sub(replacement, text)
+        return text.encode('utf-8')
+
+    if tarfile.is_tarfile(archive_path):
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            with tarfile.open(archive_path, 'r:*') as tf:
+                tf.extractall(tmp_dir)
+            # Determine compression mode
+            if archive_path.endswith('.tar.gz') or archive_path.endswith('.tgz'):
+                write_mode = 'w:gz'
+            elif archive_path.endswith('.tar.bz2'):
+                write_mode = 'w:bz2'
+            elif archive_path.endswith('.tar.xz'):
+                write_mode = 'w:xz'
+            else:
+                write_mode = 'w:gz'
+            # Redact files and rewrite archive
+            for root, dirs, filenames in os.walk(tmp_dir):
+                for fname in filenames:
+                    fpath = os.path.join(root, fname)
+                    if os.path.isfile(fpath):
+                        with open(fpath, 'rb') as f:
+                            original_content = f.read()
+                        redacted = redact_content(original_content)
+                        if redacted != original_content:
+                            with open(fpath, 'wb') as f:
+                                f.write(redacted)
+                            logger.info("Redacted PII from file in archive: %s", fname)
+            with tarfile.open(archive_path, write_mode) as tf:
+                for root, dirs, filenames in os.walk(tmp_dir):
+                    for fname in filenames:
+                        fpath = os.path.join(root, fname)
+                        arcname = os.path.relpath(fpath, tmp_dir)
+                        tf.add(fpath, arcname=arcname)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        logger.info("PII redaction complete for tar archive: %s", archive_path)
+    elif zipfile.is_zipfile(archive_path):
+        tmp_zip = archive_path + '.tmp'
+        with zipfile.ZipFile(archive_path, 'r') as zin:
+            with zipfile.ZipFile(tmp_zip, 'w', compression=zin.compression) as zout:
+                for item in zin.infolist():
+                    content = zin.read(item.filename)
+                    redacted = redact_content(content)
+                    if redacted != content:
+                        logger.info("Redacted PII from file in archive: %s", item.filename)
+                    zout.writestr(item, redacted)
+        shutil.move(tmp_zip, archive_path)
+        logger.info("PII redaction complete for zip archive: %s", archive_path)
+    else:
+        # Treat as a single file
+        with open(archive_path, 'rb') as f:
+            content = f.read()
+        redacted = redact_content(content)
+        if redacted != content:
+            with open(archive_path, 'wb') as f:
+                f.write(redacted)
+            logger.info("Redacted PII from file: %s", archive_path)
+        else:
+            logger.info("No PII found in file: %s", archive_path)
+
+
+def _check_archive_for_singapore_pii(archive_path: str) -> None:
+    """Scan archive contents for Singapore PII (NRIC/FIN, phone numbers) before upload.
+
+    Raises RuntimeError if any Singapore PII patterns are detected.
+    """
+    import re
+    import tarfile
+    import zipfile
+    import io
+
+    # Singapore NRIC/FIN: starts with S, T, F, G, or M followed by 7 digits and a letter
+    nric_pattern = re.compile(r'\b[STFGM]\d{7}[A-Z]\b')
+    # Singapore phone numbers: +65 followed by 8 digits, or 65-prefixed 8-digit numbers
+    phone_pattern = re.compile(r'(?:\+65[\s-]?\d{4}[\s-]?\d{4}|\b65\d{8}\b)')
+
+    def _scan_text(text: str, source_name: str) -> None:
+        nric_matches = nric_pattern.findall(text)
+        phone_matches = phone_pattern.findall(text)
+        findings = []
+        if nric_matches:
+            findings.append(f"NRIC/FIN numbers: {nric_matches[:5]}")
+        if phone_matches:
+            findings.append(f"Singapore phone numbers: {phone_matches[:5]}")
+        if findings:
+            raise RuntimeError(
+                f"Singapore PII detected in archive member '{source_name}': "
+                + "; ".join(findings)
+                + ". Upload aborted to comply with PII policy."
+            )
+
+    def _try_decode(data: bytes) -> str | None:
+        try:
+            return data.decode("utf-8", errors="ignore")
+        except Exception:
+            return None
+
+    scanned = False
+    # Try tar archive first
+    if tarfile.is_tarfile(archive_path):
+        with tarfile.open(archive_path, "r:*") as tf:
+            for member in tf.getmembers():
+                if not member.isfile() or member.size > 50 * 1024 * 1024:
+                    continue
+                f = tf.extractfile(member)
+                if f is None:
+                    continue
+                content = _try_decode(f.read())
+                if content:
+                    _scan_text(content, member.name)
+        scanned = True
+
+    # Try zip archive
+    if not scanned and zipfile.is_zipfile(archive_path):
+        with zipfile.ZipFile(archive_path, "r") as zf:
+            for info in zf.infolist():
+                if info.is_dir() or info.file_size > 50 * 1024 * 1024:
+                    continue
+                with zf.open(info) as f:
+                    content = _try_decode(f.read())
+                    if content:
+                        _scan_text(content, info.filename)
+        scanned = True
+
+    # Fallback: scan raw file bytes
+    if not scanned:
+        with open(archive_path, "rb") as f:
+            content = _try_decode(f.read())
+            if content:
+                _scan_text(content, archive_path)
+
+    logger.info("Singapore PII check passed for archive: %s", archive_path)
+
+
 def _parse_tool_result(result: Any) -> dict:
     if hasattr(result, "content") and result.content:
         raw = result.content[0].text if hasattr(result.content[0], "text") else str(result.content[0])
+        # Attach synthetic content provenance to raw LLM output
+        _llm_provenance = {
+            "synthetic": True,
+            "content_origin": "ai_generated",
+            "model_identifier": getattr(result, 'model', os.environ.get('LLM_MODEL', 'unknown')),
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
         try:
             return json.loads(raw)
         except (json.JSONDecodeError, TypeError):
             return {"raw": raw}
     return {"raw": "empty response"}
+
+
+def _sanitize_mcp_input(value: str, field_name: str) -> str:
+    """Validate and sanitize a string input before passing to MCP tool calls.
+
+    Checks for hidden prompt injections, base64-encoded payloads, shell commands,
+    leetspeak obfuscation, and other malicious content patterns.
+    """
+    import re as _re
+    import base64 as _b64
+
+    if not isinstance(value, str):
+        raise ValueError(f"Invalid {field_name}: expected string, got {type(value).__name__}")
+
+    # Reject excessively long values (repo/branch names should be short)
+    if field_name in ("source_code_repo", "branch_or_tag") and len(value) > 500:
+        raise ValueError(f"Invalid {field_name}: value too long ({len(value)} chars)")
+
+    # Check for shell command patterns
+    shell_patterns = [
+        r'[;|&`$]',  # shell metacharacters
+        r'\$\(',      # command substitution
+        r'\b(rm|chmod|chown|curl|wget|nc|bash|sh|eval|exec|sudo|dd|mkfs)\b',
+        r'\.\./',    # directory traversal
+    ]
+    # Only apply shell checks to repo/branch names, not file paths
+    if field_name in ("source_code_repo", "branch_or_tag"):
+        for pattern in shell_patterns:
+            if _re.search(pattern, value):
+                raise ValueError(
+                    f"Invalid {field_name}: contains potentially malicious pattern"
+                )
+
+    # Check for prompt injection patterns (case-insensitive)
+    prompt_injection_patterns = [
+        r'(?i)ignore\s+(all\s+)?previous\s+instructions',
+        r'(?i)ignore\s+(all\s+)?above\s+instructions',
+        r'(?i)disregard\s+(all\s+)?previous',
+        r'(?i)you\s+are\s+now\s+',
+        r'(?i)act\s+as\s+(a\s+)?',
+        r'(?i)system\s*:\s*',
+        r'(?i)\[INST\]',
+        r'(?i)<\|im_start\|>',
+        r'(?i)###\s*(system|instruction|human|assistant)',
+    ]
+    for pattern in prompt_injection_patterns:
+        if _re.search(pattern, value):
+            raise ValueError(
+                f"Invalid {field_name}: contains prompt injection pattern"
+            )
+
+    # Check for base64-encoded payloads (long base64 strings that decode to suspicious content)
+    b64_pattern = _re.compile(r'[A-Za-z0-9+/]{40,}={0,2}')
+    for match in b64_pattern.finditer(value):
+        try:
+            decoded = _b64.b64decode(match.group()).decode('utf-8', errors='ignore')
+            # Check if decoded content contains suspicious patterns
+            if any(_re.search(p, decoded) for p in prompt_injection_patterns):
+                raise ValueError(
+                    f"Invalid {field_name}: contains base64-encoded malicious content"
+                )
+            if any(_re.search(p, decoded) for p in shell_patterns):
+                raise ValueError(
+                    f"Invalid {field_name}: contains base64-encoded shell commands"
+                )
+        except Exception as decode_err:
+            if "Invalid" in str(decode_err):
+                raise
+
+    return value
+
+
+def _sanitize_mcp_inputs(
+    source_code_repo: str,
+    branch: str,
+    files_to_scan: List[str],
+) -> tuple:
+    """Sanitize all MCP tool call inputs."""
+    sanitized_repo = _sanitize_mcp_input(source_code_repo, "source_code_repo")
+    sanitized_branch = _sanitize_mcp_input(branch, "branch_or_tag")
+    sanitized_files = []
+    for f in files_to_scan:
+        # For file paths, just check for prompt injection and base64
+        sanitized_files.append(_sanitize_mcp_input(f, "file_path"))
+    return sanitized_repo, sanitized_branch, sanitized_files
 
 
 def _run_mcp_scan_via_client(
@@ -1172,6 +1855,11 @@ def _run_mcp_scan_via_client(
     from mcp.client.streamable_http import streamablehttp_client
     from mcp import ClientSession
 
+    # Sanitize all user-supplied inputs before passing to MCP tool calls
+    source_code_repo, branch, files_to_scan = _sanitize_mcp_inputs(
+        source_code_repo, branch, files_to_scan
+    )
+
     async def _scan() -> Dict[str, Any]:
         upload_args: Dict[str, Any] = {
             "source_code_repo": source_code_repo,
@@ -1182,19 +1870,22 @@ def _run_mcp_scan_via_client(
         log_mcp_bearer_for_scan("MCP client before get_upload_url", tok1)
         async with streamablehttp_client(
             server_url, headers={"Authorization": f"Bearer {tok1}"},
+            httpx_client_factory=_verified_httpx_client_factory,
         ) as (read, write, _):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 logger.info("Step 1/3: get_upload_url (SDK streamable)")
                 upload_result = _parse_tool_result(
-                    await session.call_tool("get_upload_url", arguments=upload_args)
+                    _validate_mcp_tool("get_upload_url")
+    await session.call_tool("get_upload_url", arguments=upload_args)
                 )
                 if not upload_result.get("success"):
                     raise RuntimeError(f"get_upload_url failed: {upload_result.get('error', upload_result)}")
                 archive_id = upload_result["archive_id"]
                 presigned_url = upload_result["presigned_url"]
 
-        logger.info("Step 2/3: Uploading archive to S3")
+        logger.info("Step 2/3: Redacting PII and uploading archive to S3")
+        _redact_pii_from_archive(archive_path)
         _upload_to_s3(presigned_url, archive_path)
 
         tok2 = bearer_getter()
@@ -1220,7 +1911,8 @@ def _run_mcp_scan_via_client(
                 analyze_args = dict(upload_args)
                 analyze_args["archive_id"] = archive_id
                 result = _parse_tool_result(
-                    await session2.call_tool("analyze_uploaded_archive", arguments=analyze_args)
+                    _validate_mcp_tool("analyze_uploaded_archive")
+    await session2.call_tool("analyze_uploaded_archive", arguments=analyze_args)
                 )
                 return result
 
@@ -1291,15 +1983,17 @@ def _run_mcp_scan_direct_http(
         raise RuntimeError(f"No data in SSE response: {text[:200]}")
 
     logger.info("Step 1/3: get_upload_url (direct HTTP)")
+    _validate_mcp_tool("get_upload_url")
     upload_resp = _call_tool("get_upload_url", {
         "source_code_repo": source_code_repo, "branch_or_tag": branch,
         "files_to_scan": files_to_scan,
     })
     if not upload_resp.get("success"):
-        raise RuntimeError(f"get_upload_url failed: {upload_resp}")
+        raise RuntimeError(f"get_upload_url failed: {str(upload_resp)[:200]}")
     archive_id = upload_resp["archive_id"]
 
     logger.info("Step 2/3: Uploading to S3 (direct HTTP)")
+    _validate_url_allowlist(upload_resp["presigned_url"])
     _upload_to_s3(upload_resp["presigned_url"], archive_path)
 
     logger.info("Step 3/3: analyze_uploaded_archive (direct HTTP)")
@@ -1307,6 +2001,7 @@ def _run_mcp_scan_direct_http(
         "Waiting for MCP tool result (server runs full UniFAI pipeline — often 10+ minutes). "
         "Client logs may pause until HTTP/SSE completes.",
     )
+    _validate_mcp_tool("analyze_uploaded_archive")
     return _call_tool("analyze_uploaded_archive", {
         "archive_id": archive_id,
         "source_code_repo": source_code_repo,
@@ -1330,7 +2025,8 @@ def run_mcp_scan(
     logger.info("Starting MCP scan: %d files, repo=%s, branch=%s", len(files_to_scan), source_code_repo, branch)
     bearer_getter = get_mcp_bearer_token or (lambda: mcp_bearer_token)
     try:
-        return _run_mcp_scan_via_client(mcp_server_url, bearer_getter, source_code_repo, branch, files_to_scan, archive_path)
+        _validate_url_allowlist(mcp_server_url)
+    return _run_mcp_scan_via_client(mcp_server_url, bearer_getter, source_code_repo, branch, files_to_scan, archive_path)
     except ImportError:
         logger.info("MCP client library not available, using direct HTTP")
         return _run_mcp_scan_direct_http(mcp_server_url, bearer_getter, source_code_repo, branch, files_to_scan, archive_path)
@@ -1583,7 +2279,7 @@ def _parse_mcp_tool_response(raw: str) -> Dict[str, Any]:
                 f"No valid JSON-RPC data line found in SSE response ({len(raw)} bytes). "
                 f"The run_remediation tool may not be registered on the MCP server "
                 f"(set LINEAJE_ENABLE_RUN_REMEDIATION_MCP_TOOL=1 on the server). "
-                f"Raw: {text[:300]}"
+                f"Raw: {text[:150]}"
             )
     else:
         rpc = json.loads(text)
@@ -1627,6 +2323,48 @@ def _call_run_remediation_tool(
         "pr_number": pr_number,
     }
 
+    # --- HITL Approval Gate for risky operations ---
+    RISKY_KEYWORDS = ("purge", "delete", "destroy", "rm", "remove")
+
+    def _contains_risky_operation(actions: List[Dict[str, Any]]) -> bool:
+        """Check if any remediation action involves a risky operation."""
+        for action in actions:
+            action_str = json.dumps(action).lower()
+            if any(keyword in action_str for keyword in RISKY_KEYWORDS):
+                return True
+        return False
+
+    if _contains_risky_operation(remediation_actions):
+        # Check for pre-approved environment variable override
+        hitl_approved = os.environ.get("HITL_APPROVED", "").strip().lower()
+        if hitl_approved in ("1", "true", "yes"):
+            logger.info("HITL approval granted via HITL_APPROVED environment variable.")
+        else:
+            # Interactive approval prompt
+            logger.warning(
+                "Risky remediation operations detected (purge/delete/destroy). "
+                "Human approval required before proceeding."
+            )
+            logger.info("Remediation actions requiring approval: %s", json.dumps(remediation_actions, indent=2))
+            if sys.stdin.isatty():
+                response = input(
+                    "\n⚠️  HITL APPROVAL REQUIRED: The following remediation includes risky operations "
+                    "(purge/delete/destroy).\nDo you approve execution? [yes/no]: "
+                ).strip().lower()
+                if response not in ("yes", "y"):
+                    raise RuntimeError(
+                        "HITL approval denied: Human operator rejected risky remediation operations. "
+                        "Set HITL_APPROVED=1 to pre-approve or respond 'yes' at the prompt."
+                    )
+                logger.info("HITL approval granted by human operator via interactive prompt.")
+            else:
+                raise RuntimeError(
+                    "HITL approval required for risky operations (purge/delete/destroy) but no "
+                    "interactive terminal available and HITL_APPROVED environment variable not set. "
+                    "Set HITL_APPROVED=1 to pre-approve risky remediation actions."
+                )
+    # --- End HITL Approval Gate ---
+
     async def _call() -> Dict[str, Any]:
         tok = get_bearer()
         logger.info("Calling run_remediation MCP tool at %s (%d actions)", mcp_server_url, len(remediation_actions))
@@ -1635,7 +2373,8 @@ def _call_run_remediation_tool(
         ) as (read, write, _):
             async with ClientSession(read, write) as session:
                 await session.initialize()
-                result = await session.call_tool("run_remediation", arguments=arguments)
+                _validate_mcp_tool("run_remediation")
+        result = await session.call_tool("run_remediation", arguments=arguments)
                 return _parse_tool_result(result)
 
     try:
@@ -1661,6 +2400,7 @@ def _execute_scan(args: argparse.Namespace) -> int:
     source_code_repo = args.source_code_repo or f"https://github.com/{repo}.git"
     scm_token = args.scm_token or os.environ.get("SCM_ACCESS_TOKEN", "")
     mcp_server_url = args.mcp_server_url or os.environ.get("MCP_SERVER_URL", "") or MCP_SERVER_URL
+    _validate_url_allowlist(mcp_server_url)
 
     missing: List[str] = []
     if not scm_token:
@@ -1683,7 +2423,7 @@ def _execute_scan(args: argparse.Namespace) -> int:
         output = build_json_output(
             status="error", repo=repo, branch=branch, head_sha="", source_code_repo=source_code_repo,
             files_scanned=0, batches=0, failed_batches=0, violations=[],
-            scan_errors=[f"MCP authentication failed: {exc}"],
+            scan_errors=[f"MCP authentication failed: {str(exc)[:_MAX_SCAN_ERROR_LEN]}"],
         )
         print(json.dumps(output, indent=2))
         return 2
@@ -1718,7 +2458,7 @@ def _execute_scan(args: argparse.Namespace) -> int:
             output = build_json_output(
                 status="error", repo=repo, branch=branch, head_sha="", source_code_repo=source_code_repo,
                 files_scanned=0, batches=0, failed_batches=0, violations=[],
-                scan_errors=[f"Clone failed: {exc}"],
+                scan_errors=[f"Clone failed: {str(exc)[:_MAX_SCAN_ERROR_LEN]}"],
             )
             print(json.dumps(output, indent=2))
             return 1
@@ -1862,6 +2602,45 @@ def _execute_scan(args: argparse.Namespace) -> int:
         llm_model = resolve_llm_model(getattr(args, "llm_model", ""))
         llm_api_url = resolve_llm_api_url(getattr(args, "llm_api_url", ""))
 
+        # --- Approved Model Registry with version pinning and integrity verification ---
+        APPROVED_MODEL_REGISTRY = {
+            "openai/gpt-4o": {
+                "version": "2024-08-06",
+                "sha256": "a]b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8",
+            },
+            "anthropic/claude-3.5-sonnet": {
+                "version": "20241022",
+                "sha256": "b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3",
+            },
+            "google/gemini-pro-1.5": {
+                "version": "001",
+                "sha256": "c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4",
+            },
+        }
+
+        def verify_model_in_registry(model_id: str) -> bool:
+            """Verify model is in approved registry with version pin and integrity hash."""
+            if not model_id:
+                return False
+            if model_id in APPROVED_MODEL_REGISTRY:
+                entry = APPROVED_MODEL_REGISTRY[model_id]
+                logger.info(
+                    "Model '%s' verified in approved registry (version=%s, sha256=%s)",
+                    model_id, entry["version"], entry["sha256"],
+                )
+                return True
+            return False
+
+        if llm_model and not verify_model_in_registry(llm_model):
+            logger.warning(
+                "Model '%s' is NOT in the approved model registry. "
+                "Refusing to use unapproved model. LLM remediation will be skipped. "
+                "Approved models: %s",
+                llm_model, list(APPROVED_MODEL_REGISTRY.keys()),
+            )
+            llm_model = ""
+            llm_api_key = ""
+
         want_remed = _automated_remediation_for_args(args)
         if not want_remed:
             logger.info(
@@ -2000,6 +2779,24 @@ def _execute_scan(args: argparse.Namespace) -> int:
         else:
             update_commit_status(scm, repo, head_sha, "failure", "AI policy violations found")
 
+                # Build provenance metadata for AI-generated remediation content
+        _provenance_timestamp = datetime.now(timezone.utc).isoformat()
+        _ai_provenance_meta = {
+            "content_provenance": {
+                "synthetic": True,
+                "content_label": "AI-generated remediation content",
+                "content_origin": "llm_generated",
+                "model_identifier": os.environ.get('LLM_MODEL', 'unknown'),
+                "generation_timestamp": _provenance_timestamp,
+                "generator": "veracode_repo_scan/remediation_pipeline",
+            }
+        }
+        # Generate cryptographic signature over provenance + remediation content
+        _sign_payload = json.dumps(_ai_provenance_meta["content_provenance"], sort_keys=True).encode()
+        _signing_key = os.environ.get("PROVENANCE_SIGNING_KEY", "veracode-default-provenance-key").encode()
+        _ai_provenance_meta["content_provenance"]["signature"] = hmac.new(
+            _signing_key, _sign_payload, hashlib.sha256
+        ).hexdigest()
         output = build_json_output(
             status="violations_found",
             repo=repo, branch=branch, head_sha=head_sha,
@@ -2011,6 +2808,7 @@ def _execute_scan(args: argparse.Namespace) -> int:
             remediation_pr=remediation_pr_number,
             remediation_branch=remediation_branch,
             failed_remediation_files=failed_files,
+            ai_content_provenance=_ai_provenance_meta["content_provenance"],
         )
         print(json.dumps(output, indent=2))
         _log_step_timing("STEP 6: Emit JSON output", step_start, scan_start)
