@@ -1,55 +1,57 @@
 #!/usr/bin/env python3
-"""UniFAI Repository Scanner — CLI tool for scanning full repositories for AI policy compliance.
+"""Veracode Repository Scanner — self-contained repo scan script with JSON output.
 
-Clones a repository, archives its contents, runs them through the MCP scanning pipeline,
-and optionally creates a remediation PR when violations are found.
-
-Unlike pr_scan.py (which scans PR diffs), this script scans the **entire** repository
-at a given branch, enabling scheduled / ad-hoc governance checks outside the PR flow.
+Clones a repository, archives its contents, runs them through the MCP scanning
+pipeline, optionally generates LLM fixes, and emits results as structured JSON
+(no markdown report).  Intended for Veracode pipeline integrations that consume
+machine-readable findings.
 
 Usage::
 
-    python scripts/repo_scan.py \
-        --provider github \
+    python scripts/veracode_repo_scan.py \
         --repo owner/repo \
         --branch main
 
-Environment variables (preferred for CI)::
+Output (stdout, JSON)::
 
-    SCM_PROVIDER         — SCM provider: github | bitbucket | gitlab (default: github)
-    SCM_ACCESS_TOKEN     — SCM access token (GitHub PAT, Bitbucket app password, GitLab PAT)
-    MCP_BEARER_TOKEN     — MCP server bearer token (Keycloak JWT)
-    MCP_DEVICE_CODE      — Native device code (alternative to bearer; exchanges for tokens)
-    DEVICE_CODE          — Alias for MCP_DEVICE_CODE
-    MCP_REFRESH_TOKEN    — Native refresh token (alternative to device code and bearer). POSTs to renew-access-token only; do not combine with MCP_DEVICE_CODE
-    LINEAJE_REFRESH_TOKEN — Alias for MCP_REFRESH_TOKEN (or optional scripts/mcp.json → ``refresh_token`` when bearer_token is empty)
-    LINEAJE_FETCH_ACCESS_TOKEN_URL   — fetch-access-token base URL (no ``?deviceCode=``). Default: ``https://lineaje-identity-service.v2.prod.veedna.com/lineajeidentity/api/v1/auth/native/fetch-access-token``
-    LINEAJE_RENEW_ACCESS_TOKEN_URL   — renew-access-token URL (same identity host as fetch for prod). Default: ``https://lineaje-identity-service.v2.prod.veedna.com/lineajeidentity/api/v1/auth/native/renew-access-token`` when MCP is v2 prod / env unset
-    LINEAJE_TOKEN_REFRESH_SKEW_SEC   — Refresh this many seconds before expiry (default: ``120``)
-    LINEAJE_DEVICE_CODE_POLL_TIMEOUT_SEC — Max seconds to poll when OIDC returns authorization_pending (default: ``300``)
-    LINEAJE_DEVICE_CODE_POLL_INTERVAL_SEC — Seconds between polls (default: ``5``)
-    MCP_SERVER_URL       — MCP server endpoint (e.g. https://mcp.example.com/mcp)
-    UNIFAI_LOG_FULL_MCP_BEARER_TOKEN / LINEAJE_LOG_FULL_MCP_BEARER_TOKEN — Full JWT logging **defaults to on**
-        when unset; set ``0`` / ``false`` / ``no`` / ``off`` to disable (recommended for production).
-        INFO logs always include ``jwt_exp_utc`` when the bearer is a JWT.
-    LLM_API_KEY          — API key for remediation LLM calls (OpenRouter; ``Authorization: Bearer``)
-    UNIFAI_API_KEY / OPENROUTER_API_KEY — Fallback if ``LLM_API_KEY`` is unset (same bearer format)
-    LLM_MODEL / UNIFAI_REMED_MODEL / UNIFAI_EVAL_MODEL — Remediation model (built-in default: ``anthropic/claude-sonnet-4.6``; see ``scripts/scan_common.py`` ``DEFAULT_LLM_MODEL``)
-    LLM_API_URL / UNIFAI_EVAL_SERVER_URL — OpenAI-compatible base or full …/chat/completions URL (blank LLM_API_URL falls back).
-        Built-in defaults when unset/blank: ``LLM_API_URL`` and ``LLM_MODEL`` are defined as ``DEFAULT_LLM_API_URL`` / ``DEFAULT_LLM_MODEL`` in ``scripts/scan_common.py``. ``LLM_API_KEY`` defaults to empty in source (``DEFAULT_LLM_API_KEY``) — set credentials in env only.
-    LINEAJE_LOG_FILE / AIPO_LOG_FILE — Append all logs (this tool, ``scan_common``, child loggers)
-        to a UTF-8 text file; parent directories are created. Or pass ``--log-file PATH`` for one run.
-        **Not tied to MCP host.** When unset and MCP URL is not loopback (e.g. deployed MCP),
-        a file under repo ``logs/`` is chosen automatically unless ``LINEAJE_SCAN_NO_AUTO_REMOTE_LOG=1``.
+    {
+      "status": "violations_found",
+      "scan_metadata": {
+        "repo": "owner/repo",
+        "branch": "main",
+        "head_sha": "abc1234",
+        "source_code_repo": "https://github.com/owner/repo.git",
+        "scanned_at": "2026-05-07T10:00:00Z",
+        "files_scanned": 150,
+        "batches": 2,
+        "failed_batches": 0
+      },
+      "violations": [...],
+      "remediation_pr": 42,
+      "remediation_branch": "remediation/unifai-repo-main",
+      "failed_remediation_files": []
+    }
 
-Constants (in this file — not environment variables)::
+Environment variables::
 
-    LINEAJE_RUN_REMEDIATION_MCP_TOOL — ``1`` = after violations, run LLM remediation and open a remediation PR
-        (remote clone mode); ``0`` = skip. Override with ``--run-remediation-mcp`` / ``--no-run-remediation-mcp``.
+    SCM_ACCESS_TOKEN     — GitHub Personal Access Token
+    MCP_REFRESH_TOKEN    — MCP server refresh token (preferred auth)
+    MCP_BEARER_TOKEN     — MCP server static bearer token (fallback)
+    LINEAJE_REFRESH_TOKEN — Alias for MCP_REFRESH_TOKEN
+    LINEAJE_RENEW_ACCESS_TOKEN_URL  — renew-access-token URL (defaults to prod)
+    LINEAJE_TOKEN_REFRESH_SKEW_SEC  — Refresh seconds before expiry (default: 120)
+    LLM_API_KEY          — API key for LLM remediation (OpenRouter, required)
+    UNIFAI_API_KEY / OPENROUTER_API_KEY — Fallback LLM key aliases
+
+Constants (in ``veracode_repo_scan.py`` — not environment variables)::
+
+    LINEAJE_RUN_REMEDIATION_MCP_TOOL — ``1`` = call MCP ``run_remediation`` after violations; ``0`` = skip.
+        Override with ``--run-remediation-mcp`` / ``--no-run-remediation-mcp``.
+        Server must register the tool (``LINEAJE_ENABLE_RUN_REMEDIATION_MCP_TOOL`` env on MCP **server** only).
 
 Exit codes::
 
-    0 — scan completed (compliant or violations posted)
+    0 — scan completed (compliant or violations found + JSON written)
     1 — scan/runtime error
     2 — configuration error
 """
@@ -57,24 +59,35 @@ Exit codes::
 from __future__ import annotations
 
 import argparse
+import asyncio
+import base64
+import difflib
 import fnmatch
+import hashlib
 import json
 import logging
 import os
 import pathlib
+import re
+import shutil
 import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
-from functools import partial
 import urllib.error
+import urllib.parse
 import urllib.request
+import uuid
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-# macOS Python installations often lack system CA certs. Install a certifi-backed
-# SSL context globally so urllib calls to S3/GitHub/etc. don't fail.
+import requests
+
+# macOS Python installations often lack system CA certs.
 try:
     import certifi
     _SSL_CTX = ssl.create_default_context(cafile=certifi.where())
@@ -84,7 +97,7 @@ except ImportError:
 _https_handler = urllib.request.HTTPSHandler(context=_SSL_CTX)
 urllib.request.install_opener(urllib.request.build_opener(_https_handler))
 
-# Ensure scripts/ directory is on the path so we can import scm_client
+# scm_client lives in the same scripts/ directory.
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
@@ -93,279 +106,576 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from scm_client import create_scm_client, SCMClient  # noqa: E402
-from config import (  # noqa: E402
-    REPO_SCAN_COMMENT_MARKER,
-    REPO_REMEDIATION_BRANCH_PREFIX,
-    DEFAULT_UNIFAI_FILE_BATCH_SIZE,
-)
 from scan_common import (  # noqa: E402
-    _ARCHIVE_EXCLUDE,
-    _ARCHIVE_EXCLUDE_GLOBS,
-    _BINARY_EXTENSIONS,
-    MAX_ARCHIVE_FILES,
-    MAX_ARCHIVE_SIZE_BYTES,
-    DEFAULT_LLM_API_URL,
-    DEFAULT_LLM_MODEL,
-    _short_description,
-    compute_line_changes,
-    _upload_to_s3,
-    run_mcp_scan,
-    group_remediation_by_file,
-    generate_fix_with_llm,
-    validate_code,
-    post_or_update_comment as _post_or_update_comment,
-    resolve_llm_api_key,
-    resolve_llm_api_url,
-    resolve_llm_model,
-    apply_llm_os_environ_defaults,
-    log_effective_llm_remediation_config,
-    detect_project_metadata,
-    collect_manifest_files,
-    collect_repo_files,
-    collect_scannable_files,
-    skill_scan_archive_metadata,
-    load_mcp_config,
-    parallel_batch_scan,
     parallel_llm_remediation,
-    canonicalize_project_name,
-    build_mcp_bearer_getter,
-    introspect_lineaje_pat,
-    log_mcp_bearer_for_scan,
-    device_code_effective,
-    refresh_token_effective,
-    lineaje_native_auth_log_label,
-    _refresh_token_effective_with_mcp_file,
-    _mcp_refresh_from_file_when_no_bearer,
+    group_remediation_by_file,
+    resolve_llm_api_key,
+    resolve_llm_model,
+    resolve_llm_api_url,
     build_remediation_scan_json_payload,
     format_pr_body_with_json_scan_results,
-    markdown_remediation_details_table,
     markdown_violations_per_file_table,
+    markdown_remediation_details_table,
     resolve_github_pr_targets,
     resolve_remediation_branch_and_existing_pr,
     stable_repo_scan_remediation_branch,
     GITHUB_PR_EMBEDDED_REPORT_MAX_CHARS,
-)
-from skill_remediation import (  # noqa: E402
-    SkillRename,
-    apply_skill_block_renames,
-    commit_content_fixes,
-    commit_skill_block_renames,
-    filter_actions_for_llm_remediation,
-    has_skill_block_remediation_actions,
+    introspect_lineaje_pat,
 )
 
-logger = logging.getLogger("repo_scan")
+logger = logging.getLogger("veracode_repo_scan")
 
-# 1 = remote mode: LLM remediation + remediation PR after violations; 0 = skip. Not read from os.environ.
+# ===========================================================================
+# Constants
+# ===========================================================================
+
+REMEDIATION_BRANCH_PREFIX = "remediation/unifai-repo"
+COMMENT_MARKER = "<!-- unifai-repo-scan -->"
+# 1 = call MCP run_remediation after violations; 0 = skip. Not read from os.environ.
 LINEAJE_RUN_REMEDIATION_MCP_TOOL = 1
+DEFAULT_MAX_ARCHIVE_SIZE_MB = 500
+DEFAULT_CLONE_TIMEOUT = 300
+DEFAULT_UNIFAI_FILE_BATCH_SIZE = 100
+MAX_ARCHIVE_FILES = 20000
+MAX_ARCHIVE_SIZE_BYTES = 20 * 1024 * 1024  # 20 MB
+
+MCP_SERVER_URL = "https://mcp.v2.prod.veedna.com/mcp"
+
+MAX_LLM_FILE_SIZE = 100_000
+LLM_TIMEOUT = 120
+
+MAX_SCAN_WORKERS = 4
+MAX_LLM_WORKERS = 5
+
+_LOG_HTTP_BODY_MAX = int(os.environ.get("LINEAJE_LOG_HTTP_BODY_MAX", "1200"))
+_DEFAULT_LINEAJE_TOKEN_REFRESH_SKEW_SEC = 120
+
+_LINEAJE_NATIVE_RENEW_ACCESS_TOKEN_URL_PROD = (
+    "https://lineaje-identity-service.v2.prod.veedna.com"
+    "/lineajeidentity/api/v1/auth/native/renew-access-token"
+)
+
+_GITHUB_CLONE_URL = "https://x-access-token:{token}@github.com/{repo}.git"
+
+_ARCHIVE_EXCLUDE = {
+    ".git", ".gitignore", ".gitattributes", ".gitmodules", ".hg", ".svn",
+    ".env", ".env.local", ".env.development", ".env.production",
+    "__pycache__", ".pytest_cache", "venv", ".venv", ".venv-scan", "env", ".tox",
+    "htmlcov", ".coverage", ".mypy_cache", ".ruff_cache",
+    "node_modules", ".yarn", ".pnp",
+    "dist", "build", ".next", ".nuxt", "out", "coverage", ".cache",
+    "target", ".gradle", ".m2",
+    "Pods", ".expo",
+    ".idea", ".vscode",
+    ".lineaje-aiepo-security",
+    "migrations", "alembic",
+}
+_ARCHIVE_EXCLUDE_GLOBS = {
+    "*.secret", "*.key", "*.pem", "*.env.*",
+    "*.zip", "*.tar", "*.tar.gz", "*.jar", "*.war", "*.swp", "*.swo",
+    "*.lock", "package-lock.json", "yarn.lock", "Pipfile.lock",
+    "poetry.lock", "Gemfile.lock", "Cargo.lock", "composer.lock",
+    "*.min.js", "*.min.css", "*.map",
+    "*_pb2.py", "*.pb.go", "*.pb.cc", "*.pb.h",
+    "*.snap",
+}
+_BINARY_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".ico", ".bmp", ".webp", ".svg",
+    ".woff", ".woff2", ".ttf", ".eot", ".otf",
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".zip", ".tar", ".gz", ".bz2", ".7z", ".rar",
+    ".exe", ".dll", ".so", ".dylib", ".class", ".jar", ".war",
+    ".pyc", ".pyo", ".o", ".a",
+    ".mp3", ".mp4", ".avi", ".mov", ".wav", ".flac",
+    ".db", ".sqlite", ".sqlite3",
+}
+
+_SENSITIVE_JSON_KEYS = frozenset({
+    "access_token", "refresh_token", "id_token", "token", "refreshToken",
+    "accessToken", "device_code", "deviceCode",
+})
+
+_SYNTAX_VALIDATORS: Dict[str, str] = {
+    ".py":   "python3 -c \"import ast; ast.parse(open('{path}').read())\"",
+    ".js":   "node --check '{path}'",
+    ".ts":   "node -e \"require('fs').readFileSync('{path}', 'utf8')\"",
+    ".json": "python3 -c \"import json; json.load(open('{path}'))\"",
+    ".yaml": "python3 -c \"import yaml; yaml.safe_load(open('{path}'))\"",
+    ".yml":  "python3 -c \"import yaml; yaml.safe_load(open('{path}'))\"",
+}
+
+# ===========================================================================
+# Env helpers (inlined from env_loader to keep script self-contained)
+# ===========================================================================
+
+def _env_truthy(var: str) -> bool:
+    v = os.environ.get(var, "").strip().lower()
+    return v not in ("", "0", "false", "no", "off")
 
 
-def _automated_remediation_for_args(args: argparse.Namespace) -> bool:
-    cli = getattr(args, "run_remediation_mcp", None)
-    if cli is not None:
-        return bool(cli)
-    return bool(LINEAJE_RUN_REMEDIATION_MCP_TOOL)
+def _env_full_mcp_bearer_logging_enabled() -> bool:
+    truthy = frozenset({"1", "true", "yes", "on"})
+    falsy = frozenset({"0", "false", "no", "off"})
+    saw_true = False
+    for var in ("UNIFAI_LOG_FULL_MCP_BEARER_TOKEN", "LINEAJE_LOG_FULL_MCP_BEARER_TOKEN"):
+        raw = os.environ.get(var, "").strip().lower()
+        if raw in falsy:
+            return False
+        if raw in truthy:
+            saw_true = True
+    return saw_true
+
+
+def _canonicalize_project_name(name: str) -> str:
+    s = re.sub(r"[^a-zA-Z0-9._-]", "-", name.strip())
+    return re.sub(r"-+", "-", s).strip("-") or "project"
+
+# ===========================================================================
+# Logging helpers
+# ===========================================================================
+
+def _truncate_for_log(s: str, max_len: Optional[int] = None) -> str:
+    m = max_len if max_len is not None else _LOG_HTTP_BODY_MAX
+    if len(s) <= m:
+        return s
+    return f"{s[:m]}... [truncated {len(s) - m} chars]"
+
+
+def _redact_mapping_for_log(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        out: Dict[str, Any] = {}
+        for k, v in obj.items():
+            kl = str(k).lower()
+            if kl in _SENSITIVE_JSON_KEYS or any(
+                sk in kl for sk in ("token", "secret", "password", "authorization")
+            ):
+                out[k] = f"<redacted len={len(v)}>" if isinstance(v, str) and v else v
+            else:
+                out[k] = _redact_mapping_for_log(v)
+        return out
+    if isinstance(obj, list):
+        return [_redact_mapping_for_log(x) for x in obj[:30]]
+    return obj
+
+
+def _safe_json_preview(raw: str) -> str:
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return _truncate_for_log(raw)
+    red = _redact_mapping_for_log(parsed)
+    try:
+        return _truncate_for_log(json.dumps(red, default=str))
+    except (TypeError, ValueError):
+        return _truncate_for_log(repr(red))
+
+
+def _jwt_exp_diag_for_log(token: str) -> str:
+    parts = (token or "").strip().split(".")
+    if len(parts) != 3:
+        return ""
+    try:
+        pad = "=" * ((4 - len(parts[1]) % 4) % 4)
+        raw = base64.urlsafe_b64decode(parts[1] + pad)
+        payload = json.loads(raw.decode("utf-8"))
+    except (ValueError, json.JSONDecodeError, OSError, UnicodeDecodeError):
+        return ""
+    exp = payload.get("exp")
+    if not isinstance(exp, (int, float)):
+        return ""
+    try:
+        dt = datetime.fromtimestamp(int(exp), tz=timezone.utc)
+    except (ValueError, OSError, OverflowError):
+        return ""
+    return f" jwt_exp_utc={dt.isoformat()}"
+
+
+def log_mcp_bearer_for_scan(where: str, token: str) -> None:
+    t = (token or "").strip()
+    if not t:
+        logger.warning("MCP bearer (%s): empty or missing", where)
+        return
+    preview = f"{t[:8]}…{t[-8:]}" if len(t) > 20 else "(short token)"
+    exp_part = _jwt_exp_diag_for_log(t)
+    logger.info("MCP bearer (%s): len=%d preview=%s%s", where, len(t), preview, exp_part)
+    if _env_full_mcp_bearer_logging_enabled():
+        logger.warning("MCP bearer (%s): INSECURE — full JWT on next INFO line", where)
+        logger.info("MCP bearer (%s) FULL_JWT:", where)
+        logger.info("%s", t)
 
 
 def _log_step_timing(label: str, step_start: float, scan_start: float) -> float:
-    """Log wall time for the step just completed and cumulative time since scan_start."""
     now = time.perf_counter()
     logger.info(
         "Timing — %s: %.1fs this step | %.1fs total",
-        label,
-        now - step_start,
-        now - scan_start,
+        label, now - step_start, now - scan_start,
     )
     return now
 
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-# Constants sourced from config.py; local aliases kept for backward compatibility.
-COMMENT_MARKER = REPO_SCAN_COMMENT_MARKER
-REMEDIATION_BRANCH_PREFIX = REPO_REMEDIATION_BRANCH_PREFIX
-DEFAULT_MAX_ARCHIVE_SIZE_MB = 500
-DEFAULT_CLONE_TIMEOUT = 300
-# DEFAULT_UNIFAI_FILE_BATCH_SIZE imported from config.py above.
-
-
-def _build_mcp_bearer_getter(
-    args: argparse.Namespace,
-    *,
-    mcp_cfg_fallback_token: str = "",
-    mcp_cfg_refresh_token: str = "",
-) -> Callable[[], str]:
-    """Delegate to :func:`scan_common.build_mcp_bearer_getter` (keeps script API stable)."""
-    return build_mcp_bearer_getter(
-        args,
-        mcp_cfg_fallback_token=mcp_cfg_fallback_token,
-        mcp_cfg_refresh_token=mcp_cfg_refresh_token,
-    )
-
-
-# Auth URL templates per SCM provider
-_AUTH_URL_TEMPLATES = {
-    "github": "https://x-access-token:{token}@github.com/{repo}.git",
-    "bitbucket": "https://x-token-auth:{token}@bitbucket.org/{repo}.git",
-    "gitlab": "https://oauth2:{token}@gitlab.com/{repo}.git",
-}
-
-
-def _repo_archive_batch_size(total_files: int) -> int:
-    """Return repository archive batch size from UNIFAI_FILE_BATCH_SIZE.
-
-    ``UNIFAI_FILE_BATCH_SIZE`` is the single source of truth for file batching.
-    For repository archives, 0 or a negative value means "all files in one
-    archive" because ``range(..., step=0)`` is invalid.
-    """
-    raw = (os.environ.get("UNIFAI_FILE_BATCH_SIZE") or "").strip()
-    if not raw:
-        return DEFAULT_UNIFAI_FILE_BATCH_SIZE
-    try:
-        size = int(raw)
-    except ValueError:
-        logger.warning(
-            "Invalid UNIFAI_FILE_BATCH_SIZE=%r; using default %d",
-            raw,
-            DEFAULT_UNIFAI_FILE_BATCH_SIZE,
-        )
-        return DEFAULT_UNIFAI_FILE_BATCH_SIZE
-    if size <= 0:
-        return max(1, total_files)
-    return size
-
-
 # ===========================================================================
-# 1. Clone Repository
+# Auth helpers
 # ===========================================================================
 
-def clone_repository(
-    repo_url: str,
-    branch: str,
-    clone_dir: str,
-    scm_token: str,
-    provider: str,
-    timeout: int = DEFAULT_CLONE_TIMEOUT,
-    max_retries: int = 2,
-) -> None:
-    """Clone a repository (shallow, single branch) into *clone_dir*.
+def _normalize_lineaje_url(url: Optional[str]) -> str:
+    if url is None:
+        return ""
+    u = str(url).strip()
+    if len(u) >= 2 and u[0] == u[-1] and u[0] in "\"'":
+        u = u[1:-1].strip()
+    return u
 
-    Builds an authenticated URL based on the SCM provider and runs ``git clone``.
-    Retries up to *max_retries* times on timeout (handles transient GitHub hangs).
-    """
-    template = _AUTH_URL_TEMPLATES.get(provider)
-    if not template:
-        raise ValueError(f"Unsupported SCM provider: {provider}")
 
-    auth_url = template.format(token=scm_token, repo=repo_url)
-    logger.info("Cloning %s (branch=%s, provider=%s) ...", repo_url, branch, provider)
+def _lineaje_url_from_env(var_name: str) -> str:
+    return _normalize_lineaje_url(os.environ.get(var_name))
 
-    cmd = ["git", "clone", "--depth", "1", "--single-branch", "--no-tags", "--branch", branch, auth_url, clone_dir]
 
-    last_exc: Exception = RuntimeError("Clone did not run")
-    for attempt in range(1, max_retries + 1):
-        if attempt > 1:
-            logger.warning("Retrying clone (attempt %d/%d) ...", attempt, max_retries)
-            # Remove partial clone dir before retry
-            import shutil
-            shutil.rmtree(clone_dir, ignore_errors=True)
-        try:
-            subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=True)
-            logger.info("Clone successful: %s", clone_dir)
-            return
-        except subprocess.TimeoutExpired as exc:
-            logger.error("Clone timed out after %ds (attempt %d/%d)", timeout, attempt, max_retries)
-            last_exc = exc
-        except subprocess.CalledProcessError as exc:
-            stderr = (exc.stderr or "").replace(scm_token, "***")
-            logger.error("Clone failed for %s: %s", repo_url, stderr[:300])
-            raise  # auth/not-found errors — no point retrying
-
-    raise last_exc
-
+def _looks_like_jwt_blob(value: str) -> bool:
+    s = value.strip()
+    if s.count(".") != 2:
+        return False
+    hdr, payload, sig = s.split(".")
+    if len(hdr) < 10 or len(payload) < 10 or len(sig) < 10:
+        return False
+    seg = re.compile(r"^[A-Za-z0-9_-]+$")
+    return bool(seg.match(hdr) and seg.match(payload) and seg.match(sig))
 
 # ===========================================================================
-# 2. Archive Creation (Repo-specific)
+# Token identity helpers (refresh-token)
 # ===========================================================================
 
-# collect_repo_files is imported from scan_common (shared with MCP server tool)
-
-def create_batch_archive(
-    clone_dir: str,
-    archive_dir: str,
-    file_subset: List[str],
-    source_code_repo: str,
-    branch: str,
-    head_sha: str,
-    batch_index: int = 0,
-    run_id: str = "",
-    skill_paths: Optional[List[str]] = None,
-) -> str:
-    """Create a zip archive for a specific subset of files.
-
-    Args:
-        clone_dir: Root of the cloned repository.
-        archive_dir: Directory to write the zip into.
-        file_subset: Repo-relative paths to include (pre-filtered by caller).
-        source_code_repo: Full repo URL (for metadata).
-        branch: Branch name (for metadata).
-        head_sha: HEAD commit SHA (for metadata).
-        batch_index: Used to give each batch archive a unique name.
-        run_id: Unused — kept for API compatibility.
-
-    Returns:
-        Path to the created zip archive.
-    """
-    archive_path = os.path.join(archive_dir, f"repo_scan_batch_{batch_index}.zip")
-    with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for rel_path in file_subset:
-            full_path = os.path.join(clone_dir, rel_path)
-            if os.path.isfile(full_path):
-                zf.write(full_path, rel_path)
-
-        metadata = {
-            "scan_source": "repo_scan",
-            "repo": source_code_repo,
-            "branch": branch,
-            "head_sha": head_sha,
-            "scan_type": "full_repository",
-            "batch_index": batch_index,
-            "batch_file_count": len(file_subset),
-        }
-        if skill_paths is not None:
-            metadata.update(skill_scan_archive_metadata(skill_paths))
-        zf.writestr("user_metadata.json", json.dumps(metadata, indent=2))
-
-    size_kb = os.path.getsize(archive_path) // 1024
-    logger.info(
-        "Created batch archive #%d: %d files, %d KB → %s",
-        batch_index, len(file_subset), size_kb, archive_path,
-    )
-    return archive_path
-
-
-def _norm_archive_rel_path(p: str) -> str:
-    """Normalize a repo-relative path for comparison (POSIX-style, no ./ prefix)."""
-    s = p.strip().replace("\\", "/")
-    while s.startswith("./"):
-        s = s[2:]
+def _normalize_token(raw: Any) -> str:
+    if raw is None:
+        return ""
+    s = str(raw).strip().lstrip("﻿").strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
+        s = s[1:-1].strip()
     return s
 
 
-def build_clone_basename_map(clone_dir: str) -> Dict[str, List[pathlib.Path]]:
-    """Walk the clone and return a mapping of basename → [full paths].
+def refresh_token_effective(args: Any) -> str:
+    from_cli = _normalize_token(getattr(args, "refresh_token", None))
+    if from_cli:
+        return from_cli
+    return _normalize_token(
+        os.environ.get("MCP_REFRESH_TOKEN", "") or os.environ.get("LINEAJE_REFRESH_TOKEN", "")
+    )
 
-    Built once before the remediation loop so basename lookups are O(1)
-    instead of a fresh rglob per file.
+
+def _refresh_token_source_label(args: Any) -> str:
+    if _normalize_token(getattr(args, "refresh_token", None)):
+        return "CLI --refresh-token"
+    if _normalize_token(os.environ.get("MCP_REFRESH_TOKEN", "")):
+        return "env MCP_REFRESH_TOKEN"
+    if _normalize_token(os.environ.get("LINEAJE_REFRESH_TOKEN", "")):
+        return "env LINEAJE_REFRESH_TOKEN"
+    return "unknown"
+
+
+def _auth_log_label(args: Any) -> str:
+    rt = refresh_token_effective(args)
+    if rt:
+        return _refresh_token_source_label(args)
+    if os.environ.get("MCP_BEARER_TOKEN", "").strip():
+        return "env MCP_BEARER_TOKEN"
+    return "static MCP_BEARER_TOKEN"
+
+# ===========================================================================
+# Token response parsing
+# ===========================================================================
+
+def _identity_token_response_dict(raw_text: str, *, context: str) -> dict:
+    text = raw_text.strip() if raw_text else ""
+    try:
+        parsed: Any = json.loads(raw_text)
+    except json.JSONDecodeError:
+        if context == "renew-access-token" and _looks_like_jwt_blob(text):
+            return {"access_token": text}
+        raise RuntimeError(f"{context}: response is not valid JSON") from None
+    for _ in range(8):
+        if isinstance(parsed, dict):
+            return parsed
+        if isinstance(parsed, str):
+            s = parsed.strip()
+            if not s:
+                raise RuntimeError(f"{context}: empty JSON string where object expected")
+            try:
+                parsed = json.loads(s)
+            except json.JSONDecodeError:
+                if context == "renew-access-token" and _looks_like_jwt_blob(s):
+                    return {"access_token": s}
+                raise RuntimeError(f"{context}: server returned error string: {s[:800]}") from None
+            continue
+        break
+    raise RuntimeError(f"{context}: unexpected JSON type after unwrap: {type(parsed).__name__}")
+
+
+# ===========================================================================
+# RefreshTokenTokenManager
+# ===========================================================================
+
+class RefreshTokenTokenManager:
+    """Obtain MCP bearer tokens via native renew-access-token only (no device code)."""
+
+    def __init__(self, refresh_token: str, renew_access_token_url: Optional[str] = None) -> None:
+        self._refresh_token = _normalize_token(refresh_token)
+        if not self._refresh_token:
+            raise ValueError("refresh_token must be non-empty")
+        self._renew_url = (
+            _normalize_lineaje_url(renew_access_token_url)
+            or _lineaje_url_from_env("LINEAJE_RENEW_ACCESS_TOKEN_URL")
+            or _LINEAJE_NATIVE_RENEW_ACCESS_TOKEN_URL_PROD
+        ).rstrip("/")
+        self._lock = threading.Lock()
+        self._access_token = ""
+        self._access_deadline = 0.0
+        try:
+            self._skew_sec = int(os.environ.get(
+                "LINEAJE_TOKEN_REFRESH_SKEW_SEC", str(_DEFAULT_LINEAJE_TOKEN_REFRESH_SKEW_SEC)
+            ))
+        except ValueError:
+            self._skew_sec = _DEFAULT_LINEAJE_TOKEN_REFRESH_SKEW_SEC
+
+    def get_access_token(self) -> str:
+        with self._lock:
+            return self._get_access_token_unlocked()
+
+    def _get_access_token_unlocked(self) -> str:
+        now = time.time()
+        if self._access_token and now < self._access_deadline - self._skew_sec:
+            return self._access_token
+        self._renew_tokens_unlocked()
+        if not self._access_token:
+            raise RuntimeError("renew-access-token did not return access_token")
+        return self._access_token
+
+    def _apply_token_payload(self, data: dict) -> None:
+        at = (data.get("access_token") or "").strip()
+        if not at:
+            raise RuntimeError(f"Token response missing access_token: {data!r}")
+        self._access_token = at
+        rt = (data.get("refresh_token") or "").strip()
+        if rt:
+            self._refresh_token = rt
+        exp = data.get("expires_in")
+        try:
+            exp_sec = int(exp) if exp is not None else 3600
+        except (TypeError, ValueError):
+            exp_sec = 3600
+        self._access_deadline = time.time() + max(60, exp_sec)
+        log_mcp_bearer_for_scan("refresh-token auth access_token", self._access_token)
+
+    def _renew_tokens_unlocked(self) -> None:
+        q = urllib.parse.urlencode({"refreshToken": self._refresh_token})
+        url = f"{self._renew_url}?{q}"
+        req = urllib.request.Request(
+            url, data=b"null",
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                payload = _identity_token_response_dict(resp.read().decode(), context="renew-access-token")
+        except urllib.error.HTTPError as exc:
+            err_body = exc.read().decode(errors="replace")
+            raise RuntimeError(f"renew-access-token HTTP {exc.code}: {err_body[:800]}") from exc
+        self._apply_token_payload(payload)
+
+
+# ===========================================================================
+# build_mcp_bearer_getter
+# ===========================================================================
+
+def build_mcp_bearer_getter(args: Any) -> Callable[[], str]:
+    """Return a callable that yields the Lineaje PAT token as the MCP bearer.
+
+    Checks ``--lineaje-pat`` / ``LINEAJE_PAT_TOKEN`` env var.
+    Raises if neither is provided.
     """
+    pat = (
+        (getattr(args, "lineaje_pat", None) or "").strip()
+        or os.environ.get("LINEAJE_PAT_TOKEN", "").strip()
+    )
+    if pat:
+        logger.info("MCP auth: Lineaje PAT token")
+        return lambda: pat
+
+    raise RuntimeError(
+        "No Lineaje PAT token found. Set LINEAJE_PAT_TOKEN env var or pass --lineaje-pat."
+    )
+
+# ===========================================================================
+# LLM config helpers — resolution delegated to scan_common imports above.
+# ===========================================================================
+
+
+def build_clone_basename_map(clone_dir: str) -> Dict[str, List[pathlib.Path]]:
+    """Map basename → [full paths] for O(1) remediation file lookup."""
     result: Dict[str, List[pathlib.Path]] = {}
     root = pathlib.Path(clone_dir)
     for p in root.rglob("*"):
         if p.is_file():
             result.setdefault(p.name, []).append(p)
     return result
+
+
+def _normalize_for_patch_match(s: str) -> str:
+    """Normalize a code snippet for fuzzy matching: collapse runs of spaces/tabs."""
+    return re.sub(r"[ \t]+", " ", s)
+
+
+def _apply_fix_entry(content: str, original: str, replacement: str) -> Tuple[str, bool]:
+    """Try to apply a single original→replacement patch with graceful fallbacks.
+
+    Matching order:
+    1. Exact substring match.
+    2. Stripped-original exact match (LLM often adds/removes leading/trailing spaces).
+    3. Whitespace-normalized match — collapse runs of spaces/tabs before comparing.
+    4. First-line anchor — if original is multi-line, match on the first non-empty line
+       and replace the block up to end-of-original.
+
+    Returns (patched_content, did_apply).
+    """
+    if not original:
+        return content, False
+
+    # 1. Exact
+    if original in content:
+        return content.replace(original, replacement, 1), True
+
+    # 2. Stripped
+    orig_stripped = original.strip()
+    if orig_stripped and orig_stripped in content:
+        return content.replace(orig_stripped, replacement, 1), True
+
+    # 3. Whitespace-normalized
+    norm_orig = _normalize_for_patch_match(orig_stripped)
+    norm_content = _normalize_for_patch_match(content)
+    idx = norm_content.find(norm_orig)
+    if idx != -1:
+        # Map normalized index back to original content offsets
+        orig_len = len(orig_stripped)
+        # Walk content to find the real start position corresponding to norm idx
+        real_idx = 0
+        norm_walked = 0
+        for ci, ch in enumerate(content):
+            if norm_walked >= idx:
+                real_idx = ci
+                break
+            norm_walked += len(_normalize_for_patch_match(ch))
+        else:
+            real_idx = len(content)
+        # Attempt simple replacement using stripped original at real_idx
+        sub = content[real_idx : real_idx + orig_len + 50]
+        if orig_stripped in sub:
+            actual_idx = content.find(orig_stripped, real_idx)
+            if actual_idx != -1:
+                return content[:actual_idx] + replacement + content[actual_idx + len(orig_stripped):], True
+
+    # 4. First-line anchor: find the first non-empty line of original in content
+    orig_lines = [l for l in orig_stripped.splitlines() if l.strip()]
+    if orig_lines:
+        anchor = orig_lines[0].strip()
+        if len(anchor) > 15:  # anchor must be distinctive enough
+            anchor_idx = content.find(anchor)
+            if anchor_idx != -1:
+                # Try to find end of original block after the anchor
+                end_search = content.find(orig_lines[-1].strip(), anchor_idx) if len(orig_lines) > 1 else anchor_idx
+                if end_search != -1:
+                    end_idx = end_search + len(orig_lines[-1].strip())
+                    found_block = content[anchor_idx:end_idx]
+                    # Only replace if found block is reasonably close to original
+                    if len(found_block) < len(orig_stripped) * 2:
+                        return content[:anchor_idx] + replacement + content[end_idx:], True
+
+    return content, False
+
+
+def apply_pipeline_fix_code_to_clone(
+    remediation_actions: List[Dict[str, Any]],
+    clone_dir: str,
+    file_list: List[str],
+    clone_basename_map: Optional[Dict[str, List[pathlib.Path]]],
+) -> Tuple[Dict[str, str], List[str], List[Dict[str, str]]]:
+    """Apply fix_code patches from pipeline remediation_actions to cloned files.
+
+    The MCP pipeline already ran LLM remediation and stored ``fix_code`` entries
+    (``{"original": ..., "replacement": ...}``) in each action.  This function
+    applies those patches directly — no extra LLM call or API key required.
+
+    Uses multi-strategy matching (exact → stripped → whitespace-normalized → first-line
+    anchor) to handle minor LLM formatting differences.
+
+    Returns:
+        (validated_fixes, failed_files, fix_table_rows)
+        validated_fixes  — {resolved_rel_path: patched_content}
+        failed_files     — filepaths where no fix_code was present or no patch applied
+        fix_table_rows   — [{policy, description, file, lines}, ...]
+    """
+    validated_fixes: Dict[str, str] = {}
+    failed_files: List[str] = []
+    fix_table_rows: List[Dict[str, str]] = []
+
+    # Group by file
+    by_file: Dict[str, List[Dict[str, Any]]] = {}
+    for action in remediation_actions:
+        fp = (action.get("file") or "").strip()
+        if fp:
+            by_file.setdefault(fp, []).append(action)
+
+    for filepath, actions in by_file.items():
+        has_fix_code = any(action.get("fix_code") for action in actions)
+        if not has_fix_code:
+            failed_files.append(filepath)
+            continue
+
+        rel_path, original_content = resolve_original_for_remediation(
+            clone_dir, "", filepath, file_list,
+            clone_basename_map=clone_basename_map,
+        )
+        if rel_path is None or original_content is None:
+            logger.warning(
+                "apply_pipeline_fix_code: cannot locate %r in clone — skipping",
+                filepath,
+            )
+            failed_files.append(filepath)
+            continue
+
+        content = original_content
+        patch_applied = False
+        for action in actions:
+            for fix_entry in (action.get("fix_code") or []):
+                original = fix_entry.get("original") or ""
+                replacement = fix_entry.get("replacement", "")
+                if not original.strip():
+                    continue
+                content, applied = _apply_fix_entry(content, original, replacement)
+                if applied:
+                    patch_applied = True
+                else:
+                    logger.debug(
+                        "apply_pipeline_fix_code: patch not applied for %r — "
+                        "original snippet (%d chars) not found in file",
+                        filepath, len(original),
+                    )
+
+        if patch_applied and content != original_content:
+            validated_fixes[rel_path] = content
+            for action in actions:
+                fix_table_rows.append({
+                    "policy": action.get("control", ""),
+                    "description": (action.get("instruction") or "")[:200],
+                    "file": filepath,
+                    "lines": "",
+                })
+        else:
+            logger.warning(
+                "apply_pipeline_fix_code: no patch applied for %r — "
+                "original snippets did not match file content",
+                filepath,
+            )
+            failed_files.append(filepath)
+
+    return validated_fixes, failed_files, fix_table_rows
 
 
 def resolve_original_for_remediation(
@@ -375,18 +685,10 @@ def resolve_original_for_remediation(
     file_list: List[str],
     clone_basename_map: Optional[Dict[str, List[pathlib.Path]]] = None,
 ) -> Tuple[Optional[str], Optional[str]]:
-    """Resolve remediation *filepath* to ``(relative_path, utf-8 text)``.
+    """Resolve a violation filepath to (relative_path, content) for LLM remediation.
 
-    Resolution order:
-    1. Exact path match in the cloned working tree.
-    2. Exact / normalised match inside the batch archive.
-    3. Unique basename match inside the batch archive.
-    4. Case-insensitive match inside the batch archive.
-    5. Unique basename match across the entire clone (via pre-built map).
-    6. Case-insensitive unique basename match across the clone.
-
-    Returns:
-        ``(resolved_relative_path, content)`` or ``(None, None)`` if not found.
+    Resolution order: exact clone path → archive exact/basename → clone basename.
+    Returns (None, None) when the file cannot be located.
     """
     raw = filepath.strip()
     if not raw:
@@ -394,234 +696,168 @@ def resolve_original_for_remediation(
     norm_fp = _norm_archive_rel_path(raw)
     root = pathlib.Path(clone_dir)
 
-    # 1. Exact path in clone
     local = root / raw
     if local.is_file():
         return _norm_archive_rel_path(raw), local.read_text(errors="replace")
 
-    # 2–4. Archive-based lookups
     if os.path.isfile(archive_path):
         with zipfile.ZipFile(archive_path, "r") as zf:
-            names = [
-                n for n in zf.namelist()
-                if not n.endswith("/") and n != "user_metadata.json"
-            ]
+            names = [n for n in zf.namelist() if not n.endswith("/") and n != "user_metadata.json"]
             norm_to_name = {_norm_archive_rel_path(n): n for n in names}
 
             def _read(member: str) -> str:
                 return zf.read(member).decode("utf-8", errors="replace")
 
-            # 2a. Exact normalised match
             if norm_fp in norm_to_name:
                 m = norm_to_name[norm_fp]
-                logger.info("Remediation path %r — using archive member %r (exact)", raw, m)
                 return _norm_archive_rel_path(m), _read(m)
-
-            # 2b. Match against file_list from the same archive build
             for listed in file_list:
                 if _norm_archive_rel_path(listed) == norm_fp:
-                    logger.info("Remediation path %r — matched file_list entry %r", raw, listed)
                     return _norm_archive_rel_path(listed), _read(listed)
-
-            # 3. Unique basename match inside archive
             base = pathlib.Path(norm_fp).name
             base_matches = [n for n in names if pathlib.Path(n).name == base]
             if len(base_matches) == 1:
-                m = base_matches[0]
-                logger.info(
-                    "Remediation path %r — resolved via unique basename to archive member %r",
-                    raw, m,
-                )
-                return _norm_archive_rel_path(m), _read(m)
-
-            # 4. Case-insensitive unique match inside archive
+                return _norm_archive_rel_path(base_matches[0]), _read(base_matches[0])
             ci_matches = [n for n in names if n.casefold() == norm_fp.casefold()]
             if len(ci_matches) == 1:
-                m = ci_matches[0]
-                logger.info(
-                    "Remediation path %r — resolved via case-insensitive match to %r",
-                    raw, m,
-                )
-                return _norm_archive_rel_path(m), _read(m)
-    else:
-        logger.warning("Archive missing for fallback read: %s", archive_path)
+                return _norm_archive_rel_path(ci_matches[0]), _read(ci_matches[0])
 
-    # 5–6. Full-clone basename lookups (catches files in other batches)
     base = pathlib.Path(norm_fp).name
     bmap = clone_basename_map or {}
-
-    # 5. Unique basename in clone
     clone_hits = bmap.get(base, [])
     if len(clone_hits) == 1:
         full = clone_hits[0]
         rel = str(full.relative_to(root))
-        logger.info(
-            "Remediation path %r — resolved via clone basename map to %r", raw, rel
-        )
         return _norm_archive_rel_path(rel), full.read_text(errors="replace")
-
-    # 6. Case-insensitive unique basename in clone
     if not clone_hits:
-        ci_clone = [
-            p for name, paths in bmap.items()
-            if name.casefold() == base.casefold()
-            for p in paths
-        ]
+        ci_clone = [p for name, paths in bmap.items() if name.casefold() == base.casefold() for p in paths]
         if len(ci_clone) == 1:
             full = ci_clone[0]
             rel = str(full.relative_to(root))
-            logger.info(
-                "Remediation path %r — resolved via clone case-insensitive basename to %r",
-                raw, rel,
-            )
             return _norm_archive_rel_path(rel), full.read_text(errors="replace")
 
-    if len(clone_hits) > 1:
-        logger.warning(
-            "Remediation path %r — ambiguous: %d clone matches for basename %r: %s",
-            raw, len(clone_hits), base,
-            [str(p.relative_to(root)) for p in clone_hits[:5]],
-        )
-
-    logger.warning(
-        "Cannot resolve remediation file %r — not in clone and not in archive %s",
-        raw, archive_path,
-    )
+    logger.warning("Cannot resolve remediation file %r in clone or archive", raw)
     return None, None
 
 
-# ===========================================================================
-# 3. PR Existence Check
-# ===========================================================================
-
-def check_pr_exists(scm: SCMClient, repo: str, pr_number: int) -> bool:
-    """Check whether a PR (or merge request) exists and is open.
-
-    Returns True if the PR exists, False otherwise.
-    """
-    try:
-        existing = scm.find_open_pr(repo, head="", base="")
-        # find_open_pr may not work for direct lookup — fall back to checking
-        # the PR comment endpoint as a lightweight existence probe.
-    except Exception:
-        pass
-
-    # Try fetching comments as a lightweight existence check
-    try:
-        scm.find_bot_comment(repo, pr_number, COMMENT_MARKER)
-        return True
-    except Exception:
-        logger.debug("PR #%d not found or not accessible in %s", pr_number, repo)
-        return False
-
-
-
-# ===========================================================================
-# 4. Resolve HEAD SHA
-# ===========================================================================
-
-def resolve_head_sha(clone_dir: str) -> str:
-    """Resolve the HEAD commit SHA from a cloned repository."""
-    result = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        capture_output=True,
-        text=True,
-        cwd=clone_dir,
-        check=True,
-    )
-    sha = result.stdout.strip()
-    logger.info("Resolved HEAD SHA: %s", sha)
-    return sha
-
-
-# ===========================================================================
-# 5. Commit Status Helper
-# ===========================================================================
-
-def update_commit_status(
-    scm: SCMClient,
+def _build_pr_body(
     repo: str,
-    sha: str,
-    state: str,
-    description: str,
-) -> None:
-    """Update the commit status on a SHA.
-
-    States: pending, success, failure, error
-    """
-    try:
-        scm.set_commit_status(repo, sha, state, description)
-        logger.info("Set commit status: %s — %s", state, description)
-    except Exception as exc:
-        logger.warning("Failed to set commit status: %s", exc)
-
-
-# ===========================================================================
-# 6. Remediation PR (repo-scan specific)
-# ===========================================================================
-
-def _post_rescan_comment(
-    scm: SCMClient,
-    repo: str,
-    pr_number: int,
-    committed_files: List[str],
+    branch: str,
+    sha_short: str,
     fix_table: List[Dict[str, str]],
-) -> None:
-    """Post a follow-up comment on an existing remediation PR summarising this re-scan.
-
-    Each re-scan appends a new comment (no idempotency marker) so the PR
-    accumulates a chronological history of what each scan run fixed.
-    """
-    run_ts = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
-
-    # Per-file violation counts for this run
+    report: str,
+    failed_files: Optional[List[str]] = None,
+    source_clone_url: str = "",
+    pr_repo: str = "",
+) -> str:
+    """Build the full PR body: intro + violations table + remediation table + full scan report + JSON."""
     violations_per_file: Dict[str, int] = {}
     for row in fix_table:
-        f = row["file"]
-        violations_per_file[f] = violations_per_file.get(f, 0) + 1
+        violations_per_file[row["file"]] = violations_per_file.get(row["file"], 0) + 1
     total_violations = sum(violations_per_file.values())
-
+    footer_note = ""
+    if failed_files:
+        footer_note = (
+            "\n\n⚠️ **{} file(s) could not be auto-patched** — "
+            "original snippet did not match file content. Review the scan report for manual fixes."
+        ).format(len(failed_files))
     scan_json = build_remediation_scan_json_payload(
         repo=repo,
-        branch="",
-        commit="",
-        files_remediated=len(committed_files),
+        branch=branch,
+        commit=sha_short,
+        files_remediated=len(violations_per_file),
         violations_per_file=violations_per_file,
         remediation_details=fix_table,
-        generator="UniFAI Repository Scanner",
+        generator="UniFAI Veracode Repository Scanner",
         extra={
-            "update_kind": "rescan",
-            "committed_files": list(committed_files),
-            "run_timestamp_utc": run_ts,
+            "pr_target_repo": pr_repo if pr_repo and pr_repo != repo else None,
+            "failed_remediation_files": failed_files or [],
         },
     )
-    table_blocks: List[str] = []
-    vtbl = markdown_violations_per_file_table(violations_per_file)
-    if vtbl:
-        table_blocks.extend(["### Violations per file", "", vtbl, ""])
-    dtbl = markdown_remediation_details_table(fix_table)
-    if dtbl:
-        table_blocks.extend(["### Remediation details", "", dtbl, ""])
+    return format_pr_body_with_json_scan_results(
+        comment_marker=COMMENT_MARKER,
+        title_md="## UniFAI Automated Policy Remediation",
+        intro_md=(
+            f"This PR contains AI policy compliance fixes for **`{repo}`** → **`{branch}`** "
+            f"(`{sha_short}`)."
+            + (f"\n\n- **Source clone URL:** `{source_clone_url}`" if source_clone_url else "")
+        ),
+        stats_md=(
+            f"**Files remediated:** {len(violations_per_file)} &nbsp;|&nbsp; "
+            f"**Total violations fixed:** {total_violations}"
+        ),
+        payload=scan_json,
+        embedded_report_md=(report or "").strip() or None,
+        embedded_report_max_chars=GITHUB_PR_EMBEDDED_REPORT_MAX_CHARS,
+        footer_md="**How to use:** Merge into `{}` to bring the repository into AI policy compliance.{}".format(
+            branch, footer_note
+        ),
+    )
 
-    lines = [
-        f"<!-- unifai-repo-scan-update -->",
+
+def post_scan_report_on_existing_pr(
+    scm: SCMClient,
+    repo: str,
+    branch: str,
+    head_sha: str,
+    fix_table: List[Dict[str, str]],
+    report: str,
+    failed_files: Optional[List[str]] = None,
+    *,
+    scm_pull_request_repo: Optional[str] = None,
+) -> Optional[int]:
+    """Find any open remediation PR for *branch* and update its body with the latest scan results.
+
+    Used when no new code patches were applied but violations were found — the existing
+    PR description is refreshed so violations/report stay current.
+    """
+    sha_short = head_sha[:7]
+    pr_home = scm_pull_request_repo or repo
+    existing_pr = scm.find_open_pr_by_prefix(pr_home, head_prefix=REMEDIATION_BRANCH_PREFIX, base=branch)
+    if not existing_pr:
+        logger.info(
+            "No existing open remediation PR for %s/%s — no PR to update with scan report",
+            pr_home, branch,
+        )
+        return None
+
+    logger.info("Posting scan results as comment on existing remediation PR #%d", existing_pr)
+    violations_per_file: Dict[str, int] = {}
+    for row in fix_table:
+        violations_per_file[row["file"]] = violations_per_file.get(row["file"], 0) + 1
+    total_violations = sum(violations_per_file.values())
+    scan_json = build_remediation_scan_json_payload(
+        repo=repo,
+        branch=branch,
+        commit=sha_short,
+        files_remediated=len(violations_per_file),
+        violations_per_file=violations_per_file,
+        remediation_details=fix_table,
+        generator="UniFAI Veracode Repository Scanner",
+        extra={"failed_remediation_files": failed_files or []},
+    )
+    run_ts = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
+    vtbl = markdown_violations_per_file_table(violations_per_file)
+    dtbl = markdown_remediation_details_table(fix_table)
+    comment_lines = [
+        "<!-- unifai-repo-scan-update -->",
         "",
         f"## UniFAI Re-scan Update — {run_ts}",
         "",
-        f"**{len(committed_files)} file(s) remediated** &nbsp;|&nbsp; **{total_violations} violation(s) fixed** in this scan run.",
+        f"**{len(violations_per_file)} file(s) remediated** &nbsp;|&nbsp; **{total_violations} violation(s) fixed** in this scan run.",
         "",
-        *table_blocks,
-        "✅ All fixes validated — syntax check passed.",
-        "",
-        f"_Generated by UniFAI Repository Scanner at {run_ts}_",
     ]
-
-    body = "\n".join(lines)
+    if vtbl:
+        comment_lines.extend(["### Violations per file", "", vtbl, ""])
+    if dtbl:
+        comment_lines.extend(["### Remediation details", "", dtbl, ""])
     try:
-        scm.post_pr_comment(repo, pr_number, body)
-        logger.info("Posted re-scan summary comment on PR #%d", pr_number)
+        scm.post_pr_comment(pr_home, existing_pr, "\n".join(comment_lines))
+        logger.info("Posted re-scan comment on remediation PR #%d", existing_pr)
+        return existing_pr
     except Exception as exc:
-        logger.warning("Failed to post re-scan comment on PR #%d: %s", pr_number, exc)
+        logger.warning("Failed to post re-scan comment on PR #%d: %s", existing_pr, exc)
+        return None
 
 
 def create_repo_remediation_pr(
@@ -633,37 +869,15 @@ def create_repo_remediation_pr(
     original_shas: Dict[str, str],
     fix_table: List[Dict[str, str]],
     *,
-    skill_renames: Optional[List[SkillRename]] = None,
     report: str = "",
     failed_files: Optional[List[str]] = None,
     source_clone_url: str = "",
     pr_target_repo_explicit: str = "",
     scm_provider: str = "github",
 ) -> Tuple[Optional[int], str]:
-    """Create a remediation branch, commit fixes, and open a PR for a repo scan.
+    """Commit fixes onto a stable remediation branch; open PR or refresh an existing one's body."""
 
-    Pull requests are POSTed via :func:`~scm_client.GitHubClient.create_pull_request` on
-    ``pr_target_repo`` when *source_clone_url* (or explicit override) references an upstream
-    ``owner/repo`` different from *repo* (fork workflow).
-
-    Args:
-        scm: SCM client instance.
-        repo: Repository slug where the branch lives (fork when scanning forks).
-        branch: Base branch scanned.
-        head_sha: HEAD commit SHA of that branch.
-        validated_fixes: Mapping of ``filepath → fixed_content``.
-        original_shas: Mapping of ``filepath → blob_sha`` on *branch* before commits.
-        fix_table: Rows of {policy, description, file, lines} for the PR body tables.
-        report: Verbatim MCP / LINEAJE markdown report for the PR body.
-        failed_files: Optional remediation failures for footer context.
-        source_clone_url: URL used when inferring upstream vs fork (GitHub HTTPS/SSH).
-        pr_target_repo_explicit: Force PR base repo slug ``owner/repo`` (upstream).
-        scm_provider: ``github``, ``gitlab``, … — fork→upstream is GitHub-specific today.
-
-    Returns:
-        *(remediation PR number or None, remediation branch name)*.
-    """
-    if not validated_fixes and not skill_renames:
+    if not validated_fixes:
         logger.info("No validated fixes — skipping remediation PR")
         return None, ""
 
@@ -672,11 +886,12 @@ def create_repo_remediation_pr(
     )
     if pr_repo.lower() != repo.lower():
         logger.info(
-            "Remediation PR opens on upstream %s (fixes committed on fork %s, head qualifier %s)",
-            pr_repo, repo, fork_login,
+            "Remediation PR opens on upstream %s (fixes committed on %s)",
+            pr_repo, repo,
         )
 
     sha_short = head_sha[:7]
+
     stable_bn = stable_repo_scan_remediation_branch(REMEDIATION_BRANCH_PREFIX, branch)
     cross_head_kw = fork_login if pr_repo.lower() != repo.lower() else None
 
@@ -697,94 +912,90 @@ def create_repo_remediation_pr(
         )
 
     committed: List[str] = []
-    renames = skill_renames or []
-    if renames:
-        committed.extend(
-            commit_skill_block_renames(
-                scm, repo, branch_name, renames, original_shas,
-                branch_existed_for_blob=branch_existed_for_blob,
-                commit_tag="unifai-repo-scan",
-            )
-        )
-    renamed_old = {old for old, _, _ in renames}
-    committed.extend(
-        commit_content_fixes(
-            scm, repo, branch_name, validated_fixes, original_shas, fix_table,
-            branch_existed_for_blob=branch_existed_for_blob,
-            commit_tag="unifai-repo-scan",
-            skip_paths=renamed_old,
-        )
-    )
+    for filepath, content in validated_fixes.items():
+        blob_sha = None if branch_existed_for_blob else original_shas.get(filepath)
+        policies = ", ".join({r["policy"] for r in fix_table if r["file"] == filepath}) or "policy violations"
+        message = f"fix({filepath}): remediate {policies} [unifai-veracode-scan]"
+        logger.info("Committing fix: %s", filepath)
+        try:
+            scm.commit_file(repo, branch_name, filepath, content.encode("utf-8"), message, sha=blob_sha)
+            committed.append(filepath)
+        except Exception as exc:
+            logger.error("Failed to commit %s: %s", filepath, exc)
 
     if not committed:
         if existing_pr_num is not None:
-            logger.info("No successful file commits — still refreshing PR #%s scan JSON/description", existing_pr_num)
+            logger.info(
+                "No successful file commits — still refreshing PR #%s scan JSON/description",
+                existing_pr_num,
+            )
         else:
             logger.warning("No files were successfully committed — skipping remediation PR workflow")
             return None, branch_name
 
     title = f"[unifai-bot] fix: AI policy remediation for {branch}@{sha_short}"
 
-    violations_per_file: Dict[str, int] = {}
-    for row in fix_table:
-        violations_per_file[row["file"]] = violations_per_file.get(row["file"], 0) + 1
-    total_violations = sum(violations_per_file.values())
-
-    footer_extra = ""
-    if failed_files:
-        footer_extra = "\n\n**Remediation engine:** Some files failed automated fix application — inspect logs.\n"
-
-    scan_json = build_remediation_scan_json_payload(
-        repo=repo,
-        branch=branch,
-        commit=sha_short,
-        files_remediated=len(validated_fixes),
-        violations_per_file=violations_per_file,
-        remediation_details=fix_table,
-        generator="UniFAI Repository Scanner",
-        extra={
-            "pr_target_repo": pr_repo if pr_repo != repo else None,
-            "report_available": bool((report or "").strip()),
-            "failed_remediation_files": failed_files or [],
-        },
-    )
-    body = format_pr_body_with_json_scan_results(
-        comment_marker=COMMENT_MARKER,
-        title_md="## UniFAI Automated Policy Remediation",
-        intro_md=(
-            f"This PR contains AI policy compliance fixes for **`{repo}`** "
-            f"(push target) merging into **`{branch}`** @ `{sha_short}`.\n\n"
-            f"- **Remediation PR repo:** `{pr_repo}`\n"
-            f"- **Clone / scan URL hint:** `{source_clone_url or '—'}`"
-        ),
-        stats_md=(
-            f"**Files remediated:** {len(validated_fixes)} &nbsp;|&nbsp; "
-            f"**Total violations fixed:** {total_violations}"
-        ),
-        payload=scan_json,
-        embedded_report_md=(report or "").strip() or None,
-        embedded_report_max_chars=GITHUB_PR_EMBEDDED_REPORT_MAX_CHARS,
-        footer_md=(
-            "✅ All fixes validated — syntax check passed.\n\n"
-            "---\n"
-            f"**How to use:** Merge into `{branch}` to restore policy compliance.{footer_extra}"
-        ),
+    pr_body = _build_pr_body(
+        repo, branch, sha_short, fix_table, report, failed_files,
+        source_clone_url=source_clone_url, pr_repo=pr_repo,
     )
 
     cross_head = fork_login if pr_repo.lower() != repo.lower() else None
+    logger.info(
+        "Create or update remediation PR: `%s` → `%s` on %s",
+        branch_name,
+        branch,
+        pr_repo,
+    )
     try:
         if existing_pr_num is not None:
-            _post_rescan_comment(scm, pr_repo, existing_pr_num, committed, fix_table)
+            run_ts = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
+            violations_per_file_c: Dict[str, int] = {}
+            for row in fix_table:
+                violations_per_file_c[row["file"]] = violations_per_file_c.get(row["file"], 0) + 1
+            total_violations_c = sum(violations_per_file_c.values())
+            scan_json_c = build_remediation_scan_json_payload(
+                repo=repo,
+                branch=branch,
+                commit=sha_short,
+                files_remediated=len(violations_per_file_c),
+                violations_per_file=violations_per_file_c,
+                remediation_details=fix_table,
+                generator="UniFAI Veracode Repository Scanner",
+                extra={
+                    "pr_target_repo": pr_repo if pr_repo != repo else None,
+                    "failed_remediation_files": failed_files or [],
+                },
+            )
+            vtbl_c = markdown_violations_per_file_table(violations_per_file_c)
+            dtbl_c = markdown_remediation_details_table(fix_table)
+            comment_lines_c = [
+                "<!-- unifai-repo-scan-update -->",
+                "",
+                f"## UniFAI Re-scan Update — {run_ts}",
+                "",
+                f"**{len(violations_per_file_c)} file(s) remediated** &nbsp;|&nbsp; **{total_violations_c} violation(s) fixed** in this scan run.",
+                "",
+            ]
+            if vtbl_c:
+                comment_lines_c.extend(["### Violations per file", "", vtbl_c, ""])
+            if dtbl_c:
+                comment_lines_c.extend(["### Remediation details", "", dtbl_c, ""])
+            try:
+                scm.post_pr_comment(pr_repo, existing_pr_num, "\n".join(comment_lines_c))
+                logger.info("Posted re-scan comment on remediation PR #%s", existing_pr_num)
+            except Exception as exc:
+                logger.warning("Failed to post re-scan comment on PR #%s: %s", existing_pr_num, exc)
             return existing_pr_num, branch_name
         remediation_pr = scm.create_pull_request(
             pr_repo,
             title,
             branch_name,
             branch,
-            body,
+            pr_body,
             cross_repo_head_owner=cross_head,
         )
-        logger.info("Created remediation PR #%d (%s)", remediation_pr, pr_repo)
+        logger.info("Created remediation PR #%d", remediation_pr)
         return remediation_pr, branch_name
     except Exception as exc:
         logger.error("Failed to create or update remediation PR: %s", exc)
@@ -792,132 +1003,726 @@ def create_repo_remediation_pr(
 
 
 # ===========================================================================
-# 7. Main Orchestration
+# Manifest file detection (doc_type: package — AI asset detection / AIBOM)
+# ===========================================================================
+# Mirrors MANIFEST_FILE_PATTERNS in mcp_server.py. Keep in sync.
+_MANIFEST_FILE_NAMES: frozenset = frozenset({
+    # Python
+    "requirements.txt", "requirements-dev.txt", "requirements-test.txt",
+    "Pipfile", "Pipfile.lock", "pyproject.toml", "setup.py", "setup.cfg", "poetry.lock",
+    "environment.yml", "environment.yaml",
+    # JavaScript / Node
+    "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock",
+    # Java / JVM
+    "pom.xml", "build.gradle", "build.gradle.kts", "gradle.lockfile",
+    # Scala
+    "build.sbt",
+    # Ruby
+    "Gemfile", "Gemfile.lock",
+    # Go
+    "go.mod", "go.sum",
+    # Rust
+    "Cargo.toml", "Cargo.lock",
+    # .NET
+    "packages.config", "packages.lock.json", "nuget.config", "Directory.Packages.props",
+    # PHP
+    "composer.json", "composer.lock",
+    # Swift
+    "Package.swift", "Package.resolved",
+    # Dart / Flutter
+    "pubspec.yaml", "pubspec.lock",
+    # Elixir
+    "mix.exs", "mix.lock",
+})
+_MANIFEST_GLOB_PATTERNS: tuple = ("*.csproj", "*.fsproj", "*.vbproj", "*.gemspec")
+
+
+def _is_manifest_file(filename: str) -> bool:
+    """Return True if *filename* (basename only) is a manifest file."""
+    if filename in _MANIFEST_FILE_NAMES:
+        return True
+    return any(fnmatch.fnmatch(filename, pat) for pat in _MANIFEST_GLOB_PATTERNS)
+
+
+# ===========================================================================
+# File collection
+# ===========================================================================
+
+def collect_repo_files(local_path: str) -> List[str]:
+    file_list: List[str] = []
+    for root, dirs, filenames in os.walk(local_path):
+        dirs[:] = [
+            d for d in dirs
+            if d not in _ARCHIVE_EXCLUDE
+            and not fnmatch.fnmatch(d, ".venv-*")
+            and not fnmatch.fnmatch(d, "venv-*")
+        ]
+        for fname in filenames:
+            full_path = os.path.join(root, fname)
+            rel_path = os.path.relpath(full_path, local_path)
+            ext = pathlib.Path(fname).suffix.lower()
+            if ext in _BINARY_EXTENSIONS:
+                continue
+            if any(fnmatch.fnmatch(rel_path, g) for g in _ARCHIVE_EXCLUDE_GLOBS):
+                continue
+            if any(p in _ARCHIVE_EXCLUDE for p in pathlib.Path(rel_path).parts):
+                continue
+            file_list.append(rel_path.replace("\\", "/"))
+    return file_list
+
+# ===========================================================================
+# Archive creation
+# ===========================================================================
+
+def _norm_archive_rel_path(p: str) -> str:
+    s = p.strip().replace("\\", "/")
+    while s.startswith("./"):
+        s = s[2:]
+    return s
+
+
+def create_batch_archive(
+    clone_dir: str,
+    archive_dir: str,
+    file_subset: List[str],
+    source_code_repo: str,
+    branch: str,
+    head_sha: str,
+    batch_index: int = 0,
+    run_id: str = "",
+    manifest_files: Optional[List[str]] = None,
+) -> str:
+    archive_path = os.path.join(archive_dir, f"repo_scan_batch_{batch_index}.zip")
+    # Manifest files (doc_type: package) are injected into every batch so that
+    # every batch triggers manifest_detected=True and AIBOM/vulnerability scanning.
+    extra_manifests = [m for m in (manifest_files or []) if m not in file_subset]
+    all_files = list(file_subset) + extra_manifests
+    with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for rel_path in all_files:
+            full_path = os.path.join(clone_dir, rel_path)
+            if os.path.isfile(full_path):
+                zf.write(full_path, rel_path)
+        metadata = {
+            "scan_source": "veracode_repo_scan",
+            "repo": source_code_repo,
+            "branch": branch,
+            "head_sha": head_sha,
+            "scan_type": "full_repository",
+            "batch_index": batch_index,
+            "batch_file_count": len(file_subset),
+            "manifest_file_count": len(extra_manifests),
+        }
+        zf.writestr("user_metadata.json", json.dumps(metadata, indent=2))
+    size_kb = os.path.getsize(archive_path) // 1024
+    logger.info(
+        "Created batch archive #%d: %d files + %d manifests, %d KB → %s",
+        batch_index, len(file_subset), len(extra_manifests), size_kb, archive_path,
+    )
+    return archive_path
+
+
+def _repo_archive_batch_size(total_files: int) -> int:
+    raw = (os.environ.get("UNIFAI_FILE_BATCH_SIZE") or "").strip()
+    if not raw:
+        return DEFAULT_UNIFAI_FILE_BATCH_SIZE
+    try:
+        size = int(raw)
+    except ValueError:
+        return DEFAULT_UNIFAI_FILE_BATCH_SIZE
+    if size <= 0:
+        return max(1, total_files)
+    return size
+
+# ===========================================================================
+# MCP scan
+# ===========================================================================
+
+def _upload_to_s3(presigned_url: str, archive_path: str) -> None:
+    size = os.path.getsize(archive_path)
+    logger.info("Uploading %d KB to S3 ...", size // 1024)
+    with open(archive_path, "rb") as f:
+        req = urllib.request.Request(
+            presigned_url, data=f.read(), method="PUT",
+            headers={"Content-Type": "application/zip"},
+        )
+        with urllib.request.urlopen(req) as resp:
+            if resp.status not in (200, 204):
+                raise RuntimeError(f"S3 upload failed: HTTP {resp.status}")
+    logger.info("S3 upload complete")
+
+
+def _parse_tool_result(result: Any) -> dict:
+    if hasattr(result, "content") and result.content:
+        raw = result.content[0].text if hasattr(result.content[0], "text") else str(result.content[0])
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return {"raw": raw}
+    return {"raw": "empty response"}
+
+
+def _run_mcp_scan_via_client(
+    server_url: str,
+    bearer_getter: Callable[[], str],
+    source_code_repo: str,
+    branch: str,
+    files_to_scan: List[str],
+    archive_path: str,
+) -> Dict[str, Any]:
+    from mcp.client.streamable_http import streamablehttp_client
+    from mcp import ClientSession
+
+    async def _scan() -> Dict[str, Any]:
+        upload_args: Dict[str, Any] = {
+            "source_code_repo": source_code_repo,
+            "branch_or_tag": branch,
+            "files_to_scan": files_to_scan,
+        }
+        tok1 = bearer_getter()
+        log_mcp_bearer_for_scan("MCP client before get_upload_url", tok1)
+        async with streamablehttp_client(
+            server_url, headers={"Authorization": f"Bearer {tok1}"},
+        ) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                logger.info("Step 1/3: get_upload_url (SDK streamable)")
+                upload_result = _parse_tool_result(
+                    await session.call_tool("get_upload_url", arguments=upload_args)
+                )
+                if not upload_result.get("success"):
+                    raise RuntimeError(f"get_upload_url failed: {upload_result.get('error', upload_result)}")
+                archive_id = upload_result["archive_id"]
+                presigned_url = upload_result["presigned_url"]
+
+        logger.info("Step 2/3: Uploading archive to S3")
+        _upload_to_s3(presigned_url, archive_path)
+
+        tok2 = bearer_getter()
+        log_mcp_bearer_for_scan("MCP client before analyze_uploaded_archive", tok2)
+        # analyze_uploaded_archive runs LLM evaluation + remediation; allow up to 30 min.
+        _analyze_sse_timeout = int(os.environ.get("UNIFAI_MCP_SSE_READ_TIMEOUT", "1800"))
+        async with streamablehttp_client(
+            server_url,
+            headers={"Authorization": f"Bearer {tok2}"},
+            sse_read_timeout=_analyze_sse_timeout,
+        ) as (read2, write2, _):
+            async with ClientSession(read2, write2) as session2:
+                await session2.initialize()
+                logger.info(
+                    "Step 3/3: analyze_uploaded_archive (SDK streamable, sse_read_timeout=%ds)",
+                    _analyze_sse_timeout,
+                )
+                logger.info(
+                    "Waiting for MCP tool result (server runs full UniFAI pipeline — often 10+ minutes). "
+                    "This process is not stuck; client logs pause until the response is received. "
+                    "Watch the mcp_server terminal for evaluation/remediation progress.",
+                )
+                analyze_args = dict(upload_args)
+                analyze_args["archive_id"] = archive_id
+                result = _parse_tool_result(
+                    await session2.call_tool("analyze_uploaded_archive", arguments=analyze_args)
+                )
+                return result
+
+    try:
+        return asyncio.run(_scan())
+    except Exception as exc:
+        try:
+            log_mcp_bearer_for_scan("MCP SDK failure (bearer at error time)", bearer_getter())
+        except Exception:
+            pass
+        logger.error("MCP streamable HTTP (SDK) failed for %s: %s", server_url, exc,
+                     exc_info=logger.isEnabledFor(logging.DEBUG))
+        raise
+
+
+def _run_mcp_scan_direct_http(
+    server_url: str,
+    bearer_getter: Callable[[], str],
+    source_code_repo: str,
+    branch: str,
+    files_to_scan: List[str],
+    archive_path: str,
+) -> Dict[str, Any]:
+    def _call_tool(tool_name: str, arguments: dict) -> dict:
+        token = bearer_getter()
+        payload = {
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": tool_name, "arguments": arguments},
+        }
+        data = json.dumps(payload).encode()
+        req = urllib.request.Request(
+            server_url, data=data,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json, text/event-stream",
+            },
+            method="POST",
+        )
+        log_mcp_bearer_for_scan(f"MCP direct HTTP before tools/call {tool_name}", token)
+        logger.info("MCP HTTP request: POST %s tool=%s body_bytes=%d", server_url, tool_name, len(data))
+        try:
+            with urllib.request.urlopen(req, timeout=600) as resp:
+                resp_text = resp.read().decode()
+                ct = (resp.headers.get("Content-Type") or "").lower()
+                if "text/event-stream" in ct:
+                    return _parse_sse_response(resp_text)
+                return json.loads(resp_text)
+        except urllib.error.HTTPError as exc:
+            err_body = exc.read().decode(errors="replace")
+            logger.error("MCP HTTP error: tool=%s HTTP %s body=%s", tool_name, exc.code, _truncate_for_log(err_body))
+            raise
+
+    def _parse_sse_response(text: str) -> dict:
+        last_data = None
+        for line in text.split("\n"):
+            if line.startswith("data: "):
+                last_data = line[6:]
+        if last_data:
+            parsed = json.loads(last_data)
+            if "result" in parsed:
+                content = parsed["result"].get("content", [])
+                if content and hasattr(content[0], "get"):
+                    return json.loads(content[0].get("text", "{}"))
+                elif content:
+                    return json.loads(str(content[0]))
+            return parsed
+        raise RuntimeError(f"No data in SSE response: {text[:200]}")
+
+    logger.info("Step 1/3: get_upload_url (direct HTTP)")
+    upload_resp = _call_tool("get_upload_url", {
+        "source_code_repo": source_code_repo, "branch_or_tag": branch,
+        "files_to_scan": files_to_scan,
+    })
+    if not upload_resp.get("success"):
+        raise RuntimeError(f"get_upload_url failed: {upload_resp}")
+    archive_id = upload_resp["archive_id"]
+
+    logger.info("Step 2/3: Uploading to S3 (direct HTTP)")
+    _upload_to_s3(upload_resp["presigned_url"], archive_path)
+
+    logger.info("Step 3/3: analyze_uploaded_archive (direct HTTP)")
+    logger.info(
+        "Waiting for MCP tool result (server runs full UniFAI pipeline — often 10+ minutes). "
+        "Client logs may pause until HTTP/SSE completes.",
+    )
+    return _call_tool("analyze_uploaded_archive", {
+        "archive_id": archive_id,
+        "source_code_repo": source_code_repo,
+        "branch_or_tag": branch,
+        "files_to_scan": files_to_scan,
+    })
+
+
+def run_mcp_scan(
+    mcp_server_url: str,
+    mcp_bearer_token: str,
+    source_code_repo: str,
+    branch: str,
+    files: Dict[str, pathlib.Path],
+    archive_path: str,
+    *,
+    get_mcp_bearer_token: Optional[Callable[[], str]] = None,
+) -> Dict[str, Any]:
+    mcp_server_url = mcp_server_url.strip()
+    files_to_scan = list(files.keys())
+    logger.info("Starting MCP scan: %d files, repo=%s, branch=%s", len(files_to_scan), source_code_repo, branch)
+    bearer_getter = get_mcp_bearer_token or (lambda: mcp_bearer_token)
+    try:
+        return _run_mcp_scan_via_client(mcp_server_url, bearer_getter, source_code_repo, branch, files_to_scan, archive_path)
+    except ImportError:
+        logger.info("MCP client library not available, using direct HTTP")
+        return _run_mcp_scan_direct_http(mcp_server_url, bearer_getter, source_code_repo, branch, files_to_scan, archive_path)
+
+# ===========================================================================
+# Parallel batch scan
+# ===========================================================================
+
+def batch_scan_exception_detail_lines(batch_idx: int, num_batches: int, exc: BaseException) -> List[str]:
+    lines = [f"Batch {batch_idx}/{num_batches} scan failed: {exc} — skipping"]
+    def _append_group(group: BaseExceptionGroup, indent: str) -> None:
+        for i, subexc in enumerate(group.exceptions, 1):
+            lines.append(f"{indent}Cause [{i}/{len(group.exceptions)}] ({type(subexc).__name__}): {subexc}")
+            if isinstance(subexc, BaseExceptionGroup):
+                _append_group(subexc, indent + "  ")
+    if isinstance(exc, BaseExceptionGroup):
+        _append_group(exc, "  ")
+    return lines
+
+
+def parallel_batch_scan(
+    batches: List[List[str]],
+    root_dir: str,
+    temp_dir: str,
+    source_code_repo: str,
+    branch: str,
+    head_sha: str,
+    run_id: str,
+    mcp_server_url: str,
+    get_mcp_bearer_token: Callable[[], str],
+    create_archive_fn: Callable,
+    max_workers: int = MAX_SCAN_WORKERS,
+    manifest_files: Optional[List[str]] = None,
+) -> Tuple[List[Dict[str, Any]], List[str], List[Dict[str, str]], Dict[str, str], str, int, List[str]]:
+    all_remediation_actions: List[Dict[str, Any]] = []
+    all_reports: List[str] = []
+    all_aibom: List[Dict[str, str]] = []
+    aibom_seen: set = set()
+    violation_archive: Dict[str, str] = {}
+    last_archive_path = ""
+    failed_batch_count = 0
+    mcp_batch_failure_details: List[str] = []
+    lock = threading.Lock()
+
+    def _scan_one(batch_idx: int, batch_files: List[str]) -> Tuple[int, str, Dict[str, Any]]:
+        logger.info("  Batch %d/%d starting: %d files", batch_idx, len(batches), len(batch_files))
+        archive_path = create_archive_fn(
+            root_dir, temp_dir, batch_files,
+            source_code_repo, branch, head_sha, batch_idx, run_id=run_id,
+            manifest_files=manifest_files,
+        )
+        try:
+            log_mcp_bearer_for_scan(f"parallel batch {batch_idx}/{len(batches)}", get_mcp_bearer_token())
+        except Exception:
+            pass
+        files_dict: Dict[str, pathlib.Path] = {
+            f: pathlib.Path(root_dir) / f
+            for f in batch_files
+            if (pathlib.Path(root_dir) / f).exists()
+        }
+        result = run_mcp_scan(
+            mcp_server_url, "", source_code_repo, branch, files_dict, archive_path,
+            get_mcp_bearer_token=get_mcp_bearer_token,
+        )
+        return batch_idx, archive_path, result
+
+    def _collect_result(batch_idx: int, archive_path: str, mcp_result: Dict[str, Any]) -> None:
+        batch_actions = mcp_result.get("remediation_actions", [])
+        batch_report = mcp_result.get("report", "")
+        batch_aibom = mcp_result.get("aibom", [])
+        logger.info("  Batch %d/%d result: status=%s, violations=%d, aibom=%d",
+                    batch_idx, len(batches), mcp_result.get("status", "unknown"),
+                    len(batch_actions), len(batch_aibom))
+        with lock:
+            all_remediation_actions.extend(batch_actions)
+            for action in batch_actions:
+                fname = action.get("file", "").strip()
+                if fname and fname not in violation_archive:
+                    violation_archive[fname] = archive_path
+            if batch_report:
+                all_reports.append(batch_report)
+            for entry in batch_aibom:
+                key = (entry.get("name", ""), entry.get("source_file", ""))
+                if key not in aibom_seen:
+                    aibom_seen.add(key)
+                    all_aibom.append(entry)
+                    logger.info(
+                        "  [AIBOM] Batch %d: discovered %s (%s) v%s from %s",
+                        batch_idx,
+                        entry.get("name", "?"),
+                        entry.get("type", "?"),
+                        entry.get("version") or "N/A",
+                        entry.get("source_file") or "N/A",
+                    )
+            nonlocal last_archive_path
+            if archive_path:
+                last_archive_path = archive_path
+
+    workers = min(len(batches), max_workers)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_map = {executor.submit(_scan_one, idx, files): idx for idx, files in enumerate(batches, 1)}
+        for future in as_completed(future_map):
+            batch_idx = future_map[future]
+            try:
+                _, archive_path, mcp_result = future.result()
+            except BaseException as exc:
+                failed_batch_count += 1
+                detail = batch_scan_exception_detail_lines(batch_idx, len(batches), exc)
+                for line in detail:
+                    logger.error("%s", line)
+                mcp_batch_failure_details.extend(detail)
+                continue
+            _collect_result(batch_idx, archive_path, mcp_result)
+
+    return all_remediation_actions, all_reports, all_aibom, violation_archive, last_archive_path, failed_batch_count, mcp_batch_failure_details
+
+# ===========================================================================
+# SCM / Git operations
+# ===========================================================================
+
+def clone_repository(
+    repo_url: str,
+    branch: str,
+    clone_dir: str,
+    scm_token: str,
+    timeout: int = DEFAULT_CLONE_TIMEOUT,
+    max_retries: int = 2,
+) -> None:
+    auth_url = _GITHUB_CLONE_URL.format(token=scm_token, repo=repo_url)
+    logger.info("Cloning %s (branch=%s) ...", repo_url, branch)
+    cmd = ["git", "clone", "--depth", "1", "--single-branch", "--no-tags", "--branch", branch, auth_url, clone_dir]
+    last_exc: Exception = RuntimeError("Clone did not run")
+    for attempt in range(1, max_retries + 1):
+        if attempt > 1:
+            logger.warning("Retrying clone (attempt %d/%d) ...", attempt, max_retries)
+            shutil.rmtree(clone_dir, ignore_errors=True)
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=True)
+            logger.info("Clone successful: %s", clone_dir)
+            return
+        except subprocess.TimeoutExpired as exc:
+            logger.error("Clone timed out after %ds (attempt %d/%d)", timeout, attempt, max_retries)
+            last_exc = exc
+        except subprocess.CalledProcessError as exc:
+            stderr = (exc.stderr or "").replace(scm_token, "***")
+            logger.error("Clone failed for %s: %s", repo_url, stderr[:300])
+            raise
+    raise last_exc
+
+
+def resolve_head_sha(clone_dir: str) -> str:
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        capture_output=True, text=True, cwd=clone_dir, check=True,
+    )
+    sha = result.stdout.strip()
+    logger.info("Resolved HEAD SHA: %s", sha)
+    return sha
+
+
+def update_commit_status(scm: SCMClient, repo: str, sha: str, state: str, description: str) -> None:
+    try:
+        scm.set_commit_status(repo, sha, state, description)
+        logger.info("Set commit status: %s — %s", state, description)
+    except Exception as exc:
+        logger.warning("Failed to set commit status: %s", exc)
+
+# ===========================================================================
+# JSON output builder
+# ===========================================================================
+
+def build_json_output(
+    *,
+    status: str,
+    repo: str,
+    branch: str,
+    head_sha: str,
+    source_code_repo: str,
+    files_scanned: int,
+    batches: int,
+    failed_batches: int,
+    violations: List[Dict[str, Any]],
+    aibom: Optional[List[Dict[str, str]]] = None,
+    report: str = "",
+    remediation_pr: Optional[int] = None,
+    remediation_branch: str = "",
+    failed_remediation_files: Optional[List[str]] = None,
+    scan_errors: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    return {
+        "status": status,
+        "scan_metadata": {
+            "repo": repo,
+            "branch": branch,
+            "head_sha": head_sha,
+            "source_code_repo": source_code_repo,
+            "scanned_at": datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "files_scanned": files_scanned,
+            "batches": batches,
+            "failed_batches": failed_batches,
+        },
+        "report": report,
+        "violations": violations,
+        "aibom": aibom or [],
+        "remediation_pr": remediation_pr,
+        "remediation_branch": remediation_branch or None,
+        "failed_remediation_files": failed_remediation_files or [],
+        "scan_errors": scan_errors or [],
+    }
+
+# ===========================================================================
+# Remediation MCP tool caller
+# ===========================================================================
+
+
+def _parse_mcp_tool_response(raw: str) -> Dict[str, Any]:
+    """Parse an MCP tool response — handles both plain JSON-RPC and SSE streams.
+
+    SSE streams from MCP Streamable HTTP may contain a mix of events:
+    - ``event: endpoint\\ndata: /mcp/sessions/...`` — session handshake, not JSON
+    - ``data: {"jsonrpc":"2.0",...}`` — the actual tool result
+
+    We try each ``data:`` line as JSON and skip non-JSON lines so the
+    session endpoint URL never causes a parse error.
+    """
+    text = raw.strip()
+    if not text:
+        raise RuntimeError(
+            "run_remediation returned an empty response body. "
+            "The MCP server may not have LINEAJE_ENABLE_RUN_REMEDIATION_MCP_TOOL=1 set, "
+            "or the tool call timed out before the server could respond."
+        )
+    # SSE: parse each data: line as JSON; skip non-JSON lines (session URLs, etc.)
+    if text.startswith("event:") or "\ndata: " in text or text.startswith("data: "):
+        rpc = None
+        for line in text.splitlines():
+            if not line.startswith("data: "):
+                continue
+            payload = line[6:].strip()
+            if not payload:
+                continue
+            try:
+                obj = json.loads(payload)
+                if isinstance(obj, dict):
+                    rpc = obj  # keep last valid JSON-RPC dict
+            except json.JSONDecodeError:
+                continue  # skip session endpoint URLs and other non-JSON lines
+        if rpc is None:
+            raise RuntimeError(
+                f"No valid JSON-RPC data line found in SSE response ({len(raw)} bytes). "
+                f"The run_remediation tool may not be registered on the MCP server "
+                f"(set LINEAJE_ENABLE_RUN_REMEDIATION_MCP_TOOL=1 on the server). "
+                f"Raw: {text[:300]}"
+            )
+    else:
+        rpc = json.loads(text)
+    if "error" in rpc:
+        raise RuntimeError(f"MCP tool error: {rpc['error']}")
+    content_blocks = rpc.get("result", {}).get("content", [])
+    for block in content_blocks:
+        if isinstance(block, dict) and block.get("type") == "text":
+            return json.loads(block["text"])
+    raise RuntimeError(f"Unexpected MCP response shape: {raw[:200]}")
+
+
+def _call_run_remediation_tool(
+    mcp_server_url: str,
+    get_bearer: Callable[[], str],
+    repo: str,
+    branch: str,
+    head_sha: str,
+    scm_token: str,
+    remediation_actions: List[Dict[str, Any]],
+    pr_number: int = 0,
+) -> Dict[str, Any]:
+    """Call the run_remediation tool on the MCP server via the MCP SDK (Streamable HTTP).
+
+    Uses the same ``streamablehttp_client`` + ``ClientSession`` transport as the scan
+    tools so session negotiation (2025-11-25 protocol, 202 Accepted, SSE result
+    delivery) is handled correctly.  The old raw-urllib approach only received the
+    session-endpoint SSE event (~182 bytes) and then failed to parse it as JSON.
+
+    The MCP server must have ``LINEAJE_ENABLE_RUN_REMEDIATION_MCP_TOOL=1`` set.
+    """
+    from mcp.client.streamable_http import streamablehttp_client
+    from mcp import ClientSession
+
+    arguments = {
+        "repo": repo,
+        "branch": branch,
+        "head_sha": head_sha,
+        "scm_token": scm_token,
+        "remediation_actions_json": json.dumps(remediation_actions),
+        "pr_number": pr_number,
+    }
+
+    async def _call() -> Dict[str, Any]:
+        tok = get_bearer()
+        logger.info("Calling run_remediation MCP tool at %s (%d actions)", mcp_server_url, len(remediation_actions))
+        async with streamablehttp_client(
+            mcp_server_url, headers={"Authorization": f"Bearer {tok}"},
+        ) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                result = await session.call_tool("run_remediation", arguments=arguments)
+                return _parse_tool_result(result)
+
+    try:
+        return asyncio.run(_call())
+    except Exception as exc:
+        raise RuntimeError(f"run_remediation MCP SDK call failed: {exc}") from exc
+
+
+def _automated_remediation_for_args(args: argparse.Namespace) -> bool:
+    cli = getattr(args, "run_remediation_mcp", None)
+    if cli is not None:
+        return bool(cli)
+    return bool(LINEAJE_RUN_REMEDIATION_MCP_TOOL)
+
+
+# ===========================================================================
+# Main scan orchestration
 # ===========================================================================
 
 def _execute_scan(args: argparse.Namespace) -> int:
-    """Execute the full repository scan pipeline."""
-
     repo = args.repo
     branch = args.branch
     source_code_repo = args.source_code_repo or f"https://github.com/{repo}.git"
-
     scm_token = args.scm_token or os.environ.get("SCM_ACCESS_TOKEN", "")
-    mcp_server_url = args.mcp_server_url or os.environ.get("MCP_SERVER_URL", "")
-    llm_api_key = resolve_llm_api_key(args.llm_api_key)
-    llm_model = resolve_llm_model(args.llm_model)
-    llm_api_url = resolve_llm_api_url(args.llm_api_url)
-    clone_timeout = args.clone_timeout
+    mcp_server_url = args.mcp_server_url or os.environ.get("MCP_SERVER_URL", "") or MCP_SERVER_URL
 
-    # --- Config validation ---
     missing: List[str] = []
     if not scm_token:
         missing.append("SCM_ACCESS_TOKEN / --scm-token")
-    if not mcp_server_url:
-        missing.append("MCP_SERVER_URL / --mcp-server-url")
-
-    mcp_cfg_auth = load_mcp_config()
-    _file_rf_remote = _mcp_refresh_from_file_when_no_bearer(
-        mcp_cfg_auth.get("bearer_token", ""),
-        mcp_cfg_auth.get("refresh_token", ""),
-    )
-    _rt_attempt, _ = _refresh_token_effective_with_mcp_file(args, _file_rf_remote)
 
     try:
-        get_mcp_bearer = _build_mcp_bearer_getter(
-            args,
-            mcp_cfg_fallback_token=mcp_cfg_auth.get("bearer_token", ""),
-            mcp_cfg_refresh_token=mcp_cfg_auth.get("refresh_token", ""),
-        )
+        get_mcp_bearer = build_mcp_bearer_getter(args)
         pat_token = get_mcp_bearer()
-        log_mcp_bearer_for_scan("repo_scan after bearer getter init", pat_token)
-
-        # Only introspect if using Lineaje PAT auth; skip for refresh-token/device-code (returns JWT)
-        pat_info = {}
-        if (getattr(args, "lineaje_pat", None) or "").strip() or os.environ.get("LINEAJE_PAT_TOKEN", "").strip():
-            pat_info = introspect_lineaje_pat(pat_token)
-            logger.info(
-                "repo_scan: MCP URL=%s | user=%s tenant=%s company=%s",
-                mcp_server_url or "(not set yet)",
-                pat_info.get("user_email", ""),
-                pat_info.get("tenant_id", ""),
-                pat_info.get("company_id", ""),
-            )
-        else:
-            logger.info(
-                "repo_scan: MCP URL=%s | auth=%s (native JWT, no PAT introspection)",
-                mcp_server_url or "(not set yet)",
-                lineaje_native_auth_log_label(
-                    args,
-                    mcp_cfg_fallback_bearer=mcp_cfg_auth.get("bearer_token", ""),
-                    mcp_cfg_refresh_token=mcp_cfg_auth.get("refresh_token", ""),
-                ),
-            )
+        log_mcp_bearer_for_scan("veracode_repo_scan startup", pat_token)
+        pat_info = introspect_lineaje_pat(pat_token)
         logger.info(
-            "repo_scan: MCP JSON-RPC/streamable URL=%s | auth=%s | "
-            "fetch-access-token / renew-access-token / POST …/mcp logged under logger 'scan_common'",
+            "MCP URL=%s | user=%s tenant=%s company=%s",
             mcp_server_url or "(not set yet)",
-            lineaje_native_auth_log_label(
-                args,
-                mcp_cfg_fallback_bearer=mcp_cfg_auth.get("bearer_token", ""),
-                mcp_cfg_refresh_token=mcp_cfg_auth.get("refresh_token", ""),
-            ),
+            pat_info.get("user_email", ""),
+            pat_info.get("tenant_id", ""),
+            pat_info.get("company_id", ""),
         )
     except Exception as exc:
         logger.error("MCP authentication failed: %s", exc)
-        if device_code_effective(args):
-            logger.error(
-                "Device code: complete the browser / device-login approval, then wait — "
-                "the CLI polls for up to LINEAJE_DEVICE_CODE_POLL_TIMEOUT_SEC (default 300s). "
-                "If you approved too late or the code expired, request a new device code and retry."
-            )
-        elif _rt_attempt:
-            logger.error(
-                "Refresh token: renew-access-token failed — the token may be expired or revoked. "
-                "Use a new refresh token or --device-code for a fresh native login."
-            )
+        output = build_json_output(
+            status="error", repo=repo, branch=branch, head_sha="", source_code_repo=source_code_repo,
+            files_scanned=0, batches=0, failed_batches=0, violations=[],
+            scan_errors=[f"MCP authentication failed: {exc}"],
+        )
+        print(json.dumps(output, indent=2))
         return 2
 
     if missing:
         logger.error("Missing required configuration: %s", ", ".join(missing))
+        output = build_json_output(
+            status="error", repo=repo, branch=branch, head_sha="", source_code_repo=source_code_repo,
+            files_scanned=0, batches=0, failed_batches=0, violations=[],
+            scan_errors=[f"Missing config: {', '.join(missing)}"],
+        )
+        print(json.dumps(output, indent=2))
         return 2
 
-    # --- Initialize SCM client ---
-    provider = args.provider or os.environ.get("SCM_PROVIDER", "github")
-    scm_base_url = args.scm_base_url or os.environ.get("SCM_BASE_URL", "")
-    scm = create_scm_client(provider=provider, token=scm_token, base_url=scm_base_url)
+    scm = create_scm_client(provider="github", token=scm_token)
 
-    # --- Check for existing remediation PR ---
-    pr_number = getattr(args, "pr", None)
-    if pr_number:
-        if check_pr_exists(scm, repo, pr_number):
-            logger.warning(
-                "Remediation PR #%d already exists for %s — skipping scan",
-                pr_number, repo,
-            )
-            return 0
-
-    # Unique ID for this scan run — used as a zip path prefix so the MCP
-    # server's fingerprint system always sees all files as "new".
     run_id = time.strftime("%Y%m%d_%H%M%S")
 
-    # --- Clone and scan ---
-    with tempfile.TemporaryDirectory(prefix="unifai-repo-scan-") as temp_dir:
+    with tempfile.TemporaryDirectory(prefix="veracode-repo-scan-") as temp_dir:
         clone_dir = os.path.join(temp_dir, "repo")
         scan_start = time.perf_counter()
 
-        # ---- Step 1: Clone repository ----
+        # ---- Step 1: Clone ----
         logger.info("=" * 60)
         logger.info("STEP 1: Clone repository")
         logger.info("=" * 60)
         step_start = time.perf_counter()
         try:
-            clone_repository(repo, branch, clone_dir, scm_token, provider, timeout=clone_timeout)
+            clone_repository(repo, branch, clone_dir, scm_token)
         except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
-            logger.error("Failed to clone repository: %s", exc)
-            _log_step_timing("STEP 1: Clone repository (failed)", step_start, scan_start)
+            logger.error("Failed to clone: %s", exc)
+            output = build_json_output(
+                status="error", repo=repo, branch=branch, head_sha="", source_code_repo=source_code_repo,
+                files_scanned=0, batches=0, failed_batches=0, violations=[],
+                scan_errors=[f"Clone failed: {exc}"],
+            )
+            print(json.dumps(output, indent=2))
             return 1
-        step_start = _log_step_timing("STEP 1: Clone repository", step_start, scan_start)
+        step_start = _log_step_timing("STEP 1: Clone", step_start, scan_start)
 
         # ---- Step 2: Resolve HEAD SHA ----
         logger.info("=" * 60)
@@ -925,62 +1730,48 @@ def _execute_scan(args: argparse.Namespace) -> int:
         logger.info("=" * 60)
         step_start = time.perf_counter()
         head_sha = resolve_head_sha(clone_dir)
-        step_start = _log_step_timing("STEP 2: Resolve HEAD SHA", step_start, scan_start)
+        step_start = _log_step_timing("STEP 2: HEAD SHA", step_start, scan_start)
 
-        # ---- Step 3: Collect scannable files ----
+        # ---- Step 3: Collect files ----
         logger.info("=" * 60)
         logger.info("STEP 3: Collect scannable files")
         logger.info("=" * 60)
         step_start = time.perf_counter()
-        file_list, skill_paths = collect_scannable_files(clone_dir)
+        file_list = collect_repo_files(clone_dir)
         if not file_list:
-            logger.info("No scannable files found in repository")
-            _log_step_timing("STEP 3: Collect scannable files", step_start, scan_start)
+            logger.info("No scannable files found")
             update_commit_status(scm, repo, head_sha, "success", "No scannable files found")
+            output = build_json_output(
+                status="compliant", repo=repo, branch=branch, head_sha=head_sha,
+                source_code_repo=source_code_repo, files_scanned=0, batches=0, failed_batches=0,
+                violations=[],
+            )
+            print(json.dumps(output, indent=2))
             return 0
 
-        if skill_paths:
-            logger.info(
-                "Skill manifests included in repo scan: %d — %s",
-                len(skill_paths),
-                ", ".join(skill_paths[:8])
-                + (" …" if len(skill_paths) > 8 else ""),
-            )
+        # Separate manifest files (doc_type: package) from code files.
+        # Manifests are injected into every batch archive so every batch triggers
+        # manifest_detected=True and AIBOM/vulnerability scanning in n8n.
+        manifest_files = [f for f in file_list if _is_manifest_file(os.path.basename(f))]
+        code_files = [f for f in file_list if not _is_manifest_file(os.path.basename(f))]
+        if manifest_files:
+            logger.info("Found %d manifest file(s) for AI asset detection — will inject into every batch", len(manifest_files))
 
-        archive_batch_size = _repo_archive_batch_size(len(file_list))
-        # Split into archive batches using UNIFAI_FILE_BATCH_SIZE so the repo
-        # scan CLI and local pipeline use the same file-batching control.
-        batches = [
-            file_list[i: i + archive_batch_size]
-            for i in range(0, len(file_list), archive_batch_size)
-        ]
+        scan_files = code_files if code_files else file_list  # fallback if repo is all manifests
+        archive_batch_size = _repo_archive_batch_size(len(scan_files))
+        batches = [scan_files[i: i + archive_batch_size] for i in range(0, len(scan_files), archive_batch_size)]
         logger.info(
-            "Found %d scannable files → %d batch(es) of ≤%d files each "
-            "(UNIFAI_FILE_BATCH_SIZE)",
-            len(file_list), len(batches), archive_batch_size,
+            "Found %d files (%d code, %d manifest) → %d batch(es) of ≤%d (UNIFAI_FILE_BATCH_SIZE)",
+            len(file_list), len(code_files), len(manifest_files), len(batches), archive_batch_size,
         )
-        step_start = _log_step_timing("STEP 3: Collect scannable files", step_start, scan_start)
+        step_start = _log_step_timing("STEP 3: Collect files", step_start, scan_start)
 
-        # Build a map: file path → batch index (1-based) for visibility
-        file_batch_map: Dict[str, int] = {}
-        for bidx, bfiles in enumerate(batches, 1):
-            for f in bfiles:
-                file_batch_map[f] = bidx
-
-        # ---- Step 4: Batch MCP scan ----
+        # ---- Step 4: MCP scan ----
         logger.info("=" * 60)
         logger.info("STEP 4: MCP scan (%d files, %d batch(es))", len(file_list), len(batches))
         logger.info("=" * 60)
-
-        logger.info(
-            "repo_scan: starting MCP batches → POST %s (tools/call get_upload_url, analyze_uploaded_archive)",
-            mcp_server_url,
-        )
-
-        # Maps violated filename → archive path of the batch that detected it
-        logger.info("Running %d batch(es) in parallel (max %d workers)", len(batches), 4)
         step_start = time.perf_counter()
-        all_remediation_actions, all_reports, violation_archive, last_archive_path, failed_batches, mcp_failure_details = (
+        all_remediation_actions, all_reports, all_aibom, violation_archive, last_archive_path, failed_batches_count, mcp_failure_details = (
             parallel_batch_scan(
                 batches=batches,
                 root_dir=clone_dir,
@@ -991,607 +1782,246 @@ def _execute_scan(args: argparse.Namespace) -> int:
                 run_id=run_id,
                 mcp_server_url=mcp_server_url,
                 get_mcp_bearer_token=get_mcp_bearer,
-                create_archive_fn=partial(create_batch_archive, skill_paths=skill_paths),
+                create_archive_fn=create_batch_archive,
+                manifest_files=manifest_files or None,
             )
         )
-
-        report = "\n\n".join(all_reports)
         remediation_actions = all_remediation_actions
         archive_path = last_archive_path
-
-        logger.info(
-            "MCP scan complete: %d total violations across %d batch(es)",
-            len(remediation_actions), len(batches),
-        )
-        step_start = _log_step_timing("STEP 4: MCP scan", step_start, scan_start)
-        if failed_batches:
-            logger.error(
-                "MCP scan incomplete: %d of %d batch(es) failed — not compliant",
-                failed_batches, len(batches),
-            )
-            if mcp_failure_details:
-                logger.error(
-                    "MCP batch failure detail:\n%s",
-                    "\n".join(mcp_failure_details),
+        logger.info("MCP scan complete: %d violations, %d AIBOM entries across %d batch(es)",
+                    len(remediation_actions), len(all_aibom), len(batches))
+        if all_aibom:
+            logger.info("[AIBOM] Full discovered asset list:")
+            for i, entry in enumerate(all_aibom, 1):
+                logger.info(
+                    "  [AIBOM] %d. %s | type=%-12s | version=%-20s | source=%s",
+                    i,
+                    entry.get("name", "?"),
+                    entry.get("type", "?"),
+                    entry.get("version") or "N/A",
+                    entry.get("source_file") or "N/A",
                 )
-            logger.error(
-                "MCP server URL (connectivity check): %s",
-                mcp_server_url,
+        else:
+            logger.info("[AIBOM] No AI assets discovered in this scan")
+        step_start = _log_step_timing("STEP 4: MCP scan", step_start, scan_start)
+
+        combined_report = "\n\n---\n\n".join(r for r in all_reports if r)
+
+        if failed_batches_count:
+            logger.error("MCP scan incomplete: %d of %d batch(es) failed", failed_batches_count, len(batches))
+            update_commit_status(scm, repo, head_sha, "error", "AI policy scan failed — MCP batch error")
+            output = build_json_output(
+                status="error", repo=repo, branch=branch, head_sha=head_sha,
+                source_code_repo=source_code_repo, files_scanned=len(file_list),
+                batches=len(batches), failed_batches=failed_batches_count,
+                violations=remediation_actions,
+                aibom=all_aibom,
+                report=combined_report,
+                scan_errors=mcp_failure_details,
             )
-            update_commit_status(
-                scm, repo, head_sha, "error",
-                "AI policy scan failed — MCP batch error",
-            )
+            print(json.dumps(output, indent=2))
             return 1
 
-        # ---- Step 5: Handle results ----
+        # ---- Step 5: Compliant path ----
         if not remediation_actions:
-            logger.info("No violations — marking success")
-            step_start = time.perf_counter()
+            logger.info("No violations — compliant")
             update_commit_status(scm, repo, head_sha, "success", "AI policy scan passed — compliant")
-            # If a remediation PR already exists from a previous run, comment on it
-            # so developers can see the repo is now clean.
-            existing_rem_pr = scm.find_open_pr_by_prefix(
-                repo, head_prefix=REMEDIATION_BRANCH_PREFIX, base=branch
-            )
+            existing_rem_pr = scm.find_open_pr_by_prefix(repo, head_prefix=REMEDIATION_BRANCH_PREFIX, base=branch)
             if existing_rem_pr:
                 run_ts = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
-                compliant_body = "\n".join([
-                    "<!-- unifai-repo-scan-update -->",
-                    "",
-                    f"## ✅ UniFAI Re-scan — {run_ts}",
-                    "",
-                    "**No findings** — the repository is now fully compliant with all AI security policies.",
-                    "",
-                    "No new violations were detected in this scan run. "
-                    "You may merge or close this PR if all previous fixes have been reviewed.",
-                    "",
-                    f"_Generated by UniFAI Repository Scanner at {run_ts}_",
-                ])
+                compliant_note = json.dumps({"event": "rescan_compliant", "scanned_at": run_ts, "message": "Repository is now fully compliant."}, indent=2)
                 try:
-                    scm.post_pr_comment(repo, existing_rem_pr, compliant_body)
-                    logger.info(
-                        "Posted compliant notice on existing remediation PR #%d", existing_rem_pr
-                    )
+                    scm.post_pr_comment(repo, existing_rem_pr, f"<!-- unifai-repo-scan-update -->\n\n```json\n{compliant_note}\n```")
                 except Exception as exc:
-                    logger.warning("Could not post compliant notice on PR #%d: %s", existing_rem_pr, exc)
-            _log_step_timing(
-                "STEP 5: Compliant — commit status and optional PR comment",
-                step_start, scan_start,
+                    logger.warning("Could not post compliant notice: %s", exc)
+            output = build_json_output(
+                status="compliant", repo=repo, branch=branch, head_sha=head_sha,
+                source_code_repo=source_code_repo, files_scanned=len(file_list),
+                batches=len(batches), failed_batches=0, violations=[], aibom=all_aibom,
+                report=combined_report,
             )
+            print(json.dumps(output, indent=2))
+            _log_step_timing("STEP 5: Compliant", step_start, scan_start)
             return 0
 
-        # ---- Step 6: LLM-based remediation ----
+        # ---- Step 5: Remediation + direct PR creation ----
+        # Strategy (in order, no LLM API key required for step A):
+        #   A) Apply fix_code patches already produced by the pipeline (original→replacement).
+        #      The MCP server ran LLM remediation; those patches are in remediation_actions.
+        #   B) For files that had no pipeline fix_code, fall back to a local LLM call
+        #      (requires LLM_API_KEY / UNIFAI_API_KEY / OPENROUTER_API_KEY).
         logger.info("=" * 60)
-        logger.info("STEP 5: LLM-based remediation (%d actions)", len(remediation_actions))
+        logger.info("STEP 5: Remediation + PR creation (%d actions)", len(remediation_actions))
         logger.info("=" * 60)
         step_start = time.perf_counter()
-
         remediation_pr_number = None
+        remediation_branch = ""
         failed_files: List[str] = []
 
-        # Each row: {policy, description, file, lines}
-        fix_table: List[Dict[str, str]] = []
+        llm_api_key = resolve_llm_api_key(getattr(args, "llm_api_key", ""))
+        llm_model = resolve_llm_model(getattr(args, "llm_model", ""))
+        llm_api_url = resolve_llm_api_url(getattr(args, "llm_api_url", ""))
 
         want_remed = _automated_remediation_for_args(args)
         if not want_remed:
             logger.info(
-                "Automated remediation skipped — off via --no-run-remediation-mcp or "
-                "LINEAJE_RUN_REMEDIATION_MCP_TOOL=0 in this script (LLM + remediation PR skipped)",
+                "Automated remediation skipped — off via --no-run-remediation-mcp "
+                "or LINEAJE_RUN_REMEDIATION_MCP_TOOL=0 in this script",
             )
             step_start = _log_step_timing(
-                "STEP 5: LLM-based remediation (skipped — scanner flag off)",
+                "STEP 5: Remediation (skipped — scanner flag off)",
                 step_start, scan_start,
             )
-        elif llm_api_key or has_skill_block_remediation_actions(remediation_actions):
-            grouped = group_remediation_by_file(remediation_actions)
-            validated_fixes: Dict[str, str] = {}
-
-            # Build a full-repo basename map once so resolution can find files
-            # that were in a different batch or whose path was omitted by n8n.
-            clone_bmap = build_clone_basename_map(clone_dir)
-            logger.info("Built clone basename map: %d unique basenames", len(clone_bmap))
-
-            def _resolve(filepath: str) -> Tuple[Optional[str], Optional[str]]:
-                src_archive = violation_archive.get(filepath, archive_path)
-                return resolve_original_for_remediation(
-                    clone_dir, src_archive, filepath, file_list,
-                    clone_basename_map=clone_bmap,
-                )
-
-            skill_renames, skill_failed, skill_rows = apply_skill_block_renames(
-                remediation_actions, _resolve, root_dir=clone_dir,
-            )
-            llm_actions = filter_actions_for_llm_remediation(remediation_actions)
-            grouped = group_remediation_by_file(llm_actions)
-            renamed_old = {old for old, _, _ in skill_renames}
-            grouped = {k: v for k, v in grouped.items() if k not in renamed_old}
-
-            failed_files = list(skill_failed)
-            fix_table = list(skill_rows)
-
-            if llm_api_key and grouped:
-                logger.info(
-                    "Running LLM remediation for %d file(s) in parallel (max %d workers)",
-                    len(grouped), 5,
-                )
-                llm_fixes, llm_failed, llm_rows = parallel_llm_remediation(
-                    grouped=grouped,
-                    resolve_fn=_resolve,
-                    llm_api_url=llm_api_url,
-                    llm_api_key=llm_api_key,
-                    llm_model=llm_model,
-                    temp_dir=temp_dir,
-                )
-                validated_fixes.update(llm_fixes)
-                failed_files.extend(llm_failed)
-                fix_table.extend(llm_rows)
-            elif grouped and not llm_api_key:
-                logger.warning(
-                    "Skipping LLM remediation for %d non-skill file(s) — no LLM API key",
-                    len(grouped),
-                )
-                failed_files.extend(grouped.keys())
-            step_start = _log_step_timing(
-                "STEP 5: LLM-based remediation",
-                step_start, scan_start,
-            )
-
-            # ---- Step 7: Create remediation PR ----
-            if validated_fixes or skill_renames:
-                logger.info("=" * 60)
-                logger.info("STEP 6: Create remediation PR (%d files)", len(validated_fixes))
-                logger.info("=" * 60)
-                step_start = time.perf_counter()
-                # Pre-resolve blob SHAs from the *source* branch (stable, already
-                # exists) so commit_file doesn't have to query the freshly-created
-                # remediation branch, which can 404 due to GitHub propagation delay.
-                original_shas: Dict[str, str] = {}
-                for filepath in validated_fixes:
-                    blob_sha = scm.get_file_blob_sha(repo, filepath, head_sha)
-                    if blob_sha:
-                        original_shas[filepath] = blob_sha
-                    else:
-                        logger.debug("No blob SHA for %s at %s (new file?)", filepath, head_sha[:7])
-                for old_path, new_path, _ in skill_renames:
-                    if old_path not in original_shas:
-                        blob_sha = scm.get_file_blob_sha(repo, old_path, head_sha)
-                        if blob_sha:
-                            original_shas[old_path] = blob_sha
-                    if new_path not in original_shas:
-                        blob_sha = scm.get_file_blob_sha(repo, new_path, head_sha)
-                        if blob_sha:
-                            original_shas[new_path] = blob_sha
-                remediation_pr_number, _remediation_branch_actual = create_repo_remediation_pr(
-                    scm, repo, branch, head_sha,
-                    validated_fixes, original_shas, fix_table,
-                    skill_renames=skill_renames,
-                    report=report,
-                    source_clone_url=source_code_repo,
-                    pr_target_repo_explicit=getattr(args, "pr_target_repo", ""),
-                    scm_provider=provider,
-                )
-                step_start = _log_step_timing(
-                    "STEP 6: Create remediation PR",
-                    step_start, scan_start,
-                )
-
-            if failed_files:
-                logger.warning(
-                    "Failed to remediate %d files: %s",
-                    len(failed_files), ", ".join(failed_files),
-                )
+        elif not scm_token:
+            logger.info("No SCM token — skipping automated remediation (set SCM_ACCESS_TOKEN)")
+            step_start = _log_step_timing("STEP 5: Remediation (skipped — no SCM token)", step_start, scan_start)
         else:
-            logger.info("No LLM API key provided — skipping automated remediation")
-            step_start = _log_step_timing(
-                "STEP 5: LLM-based remediation (skipped — no API key)",
-                step_start, scan_start,
-            )
+            try:
+                clone_bmap = build_clone_basename_map(clone_dir)
 
-        # ---- Step 8: Update status ----
+                # --- Step 5A: apply pipeline fix_code patches (no LLM key needed) ---
+                logger.info(
+                    "STEP 5A: Applying pipeline fix_code patches from %d action(s)",
+                    len(remediation_actions),
+                )
+                validated_fixes, no_fix_code_files, fix_table = apply_pipeline_fix_code_to_clone(
+                    remediation_actions, clone_dir, file_list, clone_bmap,
+                )
+                step_start = _log_step_timing("STEP 5A: Apply pipeline fix_code", step_start, scan_start)
+                logger.info(
+                    "STEP 5A: applied patches for %d file(s); %d file(s) had no fix_code",
+                    len(validated_fixes), len(no_fix_code_files),
+                )
+
+                # --- Step 5B: LLM fallback for files with no fix_code ---
+                if no_fix_code_files and llm_api_key:
+                    logger.info(
+                        "STEP 5B: LLM fallback for %d file(s) without pipeline fix_code (model=%s)",
+                        len(no_fix_code_files), llm_model,
+                    )
+                    fallback_actions = [
+                        a for a in remediation_actions
+                        if (a.get("file") or "").strip() in no_fix_code_files
+                    ]
+                    grouped_fallback = group_remediation_by_file(fallback_actions)
+
+                    def _resolve(filepath: str) -> Tuple[Optional[str], Optional[str]]:
+                        src_archive = violation_archive.get(filepath, archive_path)
+                        return resolve_original_for_remediation(
+                            clone_dir, src_archive, filepath, file_list,
+                            clone_basename_map=clone_bmap,
+                        )
+
+                    llm_fixes, llm_failed, llm_fix_table = parallel_llm_remediation(
+                        grouped=grouped_fallback,
+                        resolve_fn=_resolve,
+                        llm_api_url=llm_api_url,
+                        llm_api_key=llm_api_key,
+                        llm_model=llm_model,
+                        temp_dir=temp_dir,
+                    )
+                    validated_fixes.update(llm_fixes)
+                    fix_table.extend(llm_fix_table)
+                    failed_files = llm_failed
+                    step_start = _log_step_timing("STEP 5B: LLM fallback remediation", step_start, scan_start)
+                    logger.info(
+                        "STEP 5B: LLM remediation: validated=%d failed=%d",
+                        len(llm_fixes), len(llm_failed),
+                    )
+                elif no_fix_code_files:
+                    logger.info(
+                        "STEP 5B: %d file(s) have no fix_code and no LLM key set — "
+                        "skipping LLM fallback (set LLM_API_KEY / UNIFAI_API_KEY / OPENROUTER_API_KEY)",
+                        len(no_fix_code_files),
+                    )
+                    failed_files = no_fix_code_files
+
+                if validated_fixes:
+                    logger.info("=" * 60)
+                    logger.info("STEP 6: Create/update remediation PR (%d files)", len(validated_fixes))
+                    logger.info("=" * 60)
+                    step_start = time.perf_counter()
+                    original_shas: Dict[str, str] = {}
+                    for filepath in validated_fixes:
+                        blob_sha = scm.get_file_blob_sha(repo, filepath, head_sha)
+                        if blob_sha:
+                            original_shas[filepath] = blob_sha
+                    remediation_pr_number, remediation_branch = create_repo_remediation_pr(
+                        scm, repo, branch, head_sha,
+                        validated_fixes, original_shas, fix_table,
+                        report=combined_report,
+                        failed_files=failed_files,
+                        source_clone_url=source_code_repo,
+                        pr_target_repo_explicit=getattr(args, "pr_target_repo", ""),
+                    )
+                    step_start = _log_step_timing("STEP 6: Create/update remediation PR", step_start, scan_start)
+                    if remediation_pr_number:
+                        logger.info("Remediation PR #%d created/updated", remediation_pr_number)
+                    else:
+                        logger.warning("PR creation failed — fixes are on branch %s but no PR opened", remediation_branch)
+                else:
+                    # No code patches applied — still update the existing remediation PR with the report.
+                    logger.warning(
+                        "No validated fixes — pipeline fix_code patches did not match file content "
+                        "(LLM_API_KEY can enable fallback). "
+                        "Checking for existing open PR to post scan report...",
+                    )
+                    scm_prov = (os.environ.get("SCM_PROVIDER", "github") or "github").strip()
+                    pr_listing_slug, _ = resolve_github_pr_targets(
+                        repo,
+                        source_code_repo,
+                        scm_prov,
+                        getattr(args, "pr_target_repo", ""),
+                    )
+                    remediation_pr_number = post_scan_report_on_existing_pr(
+                        scm, repo, branch, head_sha, fix_table, combined_report, failed_files,
+                        scm_pull_request_repo=pr_listing_slug,
+                    )
+                    if not remediation_pr_number:
+                        logger.info(
+                            "No existing remediation PR found — violations report written to JSON output only",
+                        )
+
+                if failed_files:
+                    logger.warning("Failed to remediate %d file(s): %s", len(failed_files), ", ".join(str(f) for f in failed_files))
+            except Exception as exc:
+                logger.error("Remediation failed: %s", exc)
+                failed_files = [f"remediation_error: {exc}"]
+            step_start = _log_step_timing("STEP 5: Remediation (total)", step_start, scan_start)
+
+        # ---- Step 6: Update commit status + emit JSON ----
         logger.info("=" * 60)
-        logger.info("STEP 7: Update commit status")
+        logger.info("STEP 6: Update commit status + emit JSON")
         logger.info("=" * 60)
         step_start = time.perf_counter()
         if remediation_pr_number:
-            update_commit_status(
-                scm, repo, head_sha, "failure",
-                f"Policy violations found — remediation PR #{remediation_pr_number} created",
-            )
+            update_commit_status(scm, repo, head_sha, "failure",
+                                 f"Policy violations found — remediation PR #{remediation_pr_number} created")
         else:
             update_commit_status(scm, repo, head_sha, "failure", "AI policy violations found")
-        _log_step_timing("STEP 7: Update commit status", step_start, scan_start)
-        logger.info(
-            "Timing — clone & scan pipeline finished: %.1fs total",
-            time.perf_counter() - scan_start,
-        )
 
+        output = build_json_output(
+            status="violations_found",
+            repo=repo, branch=branch, head_sha=head_sha,
+            source_code_repo=source_code_repo,
+            files_scanned=len(file_list), batches=len(batches), failed_batches=0,
+            violations=remediation_actions,
+            aibom=all_aibom,
+            report=combined_report,
+            remediation_pr=remediation_pr_number,
+            remediation_branch=remediation_branch,
+            failed_remediation_files=failed_files,
+        )
+        print(json.dumps(output, indent=2))
+        _log_step_timing("STEP 6: Emit JSON output", step_start, scan_start)
+        logger.info("Timing — pipeline finished: %.1fs total", time.perf_counter() - scan_start)
         return 0
-
-
-# ===========================================================================
-# Local Mode: apply fixes directly to the filesystem
-# ===========================================================================
-
-def _apply_fixes_locally(validated_fixes: Dict[str, str], local_path: str) -> List[str]:
-    """Write validated LLM-generated fixes directly to the local filesystem.
-
-    Creates a ``unifai_backup/`` directory next to each file before overwriting,
-    so the original is always recoverable.
-
-    Returns the list of files successfully written.
-    """
-    written: List[str] = []
-    backup_root = os.path.join(local_path, "unifai_backup")
-    os.makedirs(backup_root, exist_ok=True)
-
-    for rel_path, content in validated_fixes.items():
-        abs_path = os.path.join(local_path, rel_path)
-        if not os.path.isfile(abs_path):
-            logger.warning("Cannot apply fix — file not found on disk: %s", abs_path)
-            continue
-
-        # Back up original
-        backup_path = os.path.join(backup_root, rel_path.replace("/", "__"))
-        try:
-            import shutil
-            shutil.copy2(abs_path, backup_path)
-            logger.debug("Backed up %s → %s", rel_path, backup_path)
-        except Exception as exc:
-            logger.warning("Could not back up %s: %s — skipping fix", rel_path, exc)
-            continue
-
-        # Write fix
-        try:
-            os.makedirs(os.path.dirname(abs_path), exist_ok=True)
-            with open(abs_path, "w", encoding="utf-8") as fh:
-                fh.write(content)
-            logger.info("✅ Applied fix to %s", rel_path)
-            written.append(rel_path)
-        except Exception as exc:
-            logger.error("Failed to write fix for %s: %s", rel_path, exc)
-
-    return written
-
-
-# ===========================================================================
-# Local Mode: full scan pipeline (no clone, no PR creation)
-# ===========================================================================
-
-def _execute_local_scan(args: argparse.Namespace) -> int:
-    """Run the scan pipeline against a local directory.
-
-    This is the entry point for IDE (Cursor) and CLI local-mode invocations.
-    It is completely separate from the remote _execute_scan() path — no SCM
-    operations, no PR creation.
-
-    Modes controlled by flags:
-      --output-json   Emit {report, remediation_actions} JSON to stdout and exit.
-                      No LLM call. Intended for Cursor — Cursor applies the fixes.
-      --apply-fixes   After LLM generates fixes, write them to the local filesystem.
-                      Requires --llm-api-key.
-      (neither)       Print the report to stdout. No file changes.
-    """
-    local_path = os.path.abspath(args.local_path)
-    if not os.path.isdir(local_path):
-        logger.error("--local-path does not exist or is not a directory: %s", local_path)
-        return 2
-
-    # Load mcp.json first — same config file Cursor/CLI uses to connect to the server.
-    # This means zero extra config needed if mcp.json is already set up.
-    mcp_cfg = load_mcp_config()
-
-    mcp_server_url = args.mcp_server_url or os.environ.get("MCP_SERVER_URL", "") or mcp_cfg.get("server_url", "")
-    llm_api_key = resolve_llm_api_key(args.llm_api_key)
-    llm_model = resolve_llm_model(args.llm_model)
-    llm_api_url = resolve_llm_api_url(args.llm_api_url)
-
-    if not mcp_server_url:
-        logger.error(
-            "Missing MCP server URL. Set it via --mcp-server-url, MCP_SERVER_URL env var, "
-            "or scripts/mcp.json → server_url"
-        )
-        return 2
-
-    try:
-        get_mcp_bearer = _build_mcp_bearer_getter(
-            args,
-            mcp_cfg_fallback_token=mcp_cfg.get("bearer_token", ""),
-            mcp_cfg_refresh_token=mcp_cfg.get("refresh_token", ""),
-        )
-        pat_token = get_mcp_bearer()
-        log_mcp_bearer_for_scan("repo_scan local mode after bearer init", pat_token)
-        pat_info = introspect_lineaje_pat(pat_token)
-        logger.info(
-            "repo_scan (local): MCP URL=%s | user=%s tenant=%s company=%s",
-            mcp_server_url,
-            pat_info.get("user_email", ""),
-            pat_info.get("tenant_id", ""),
-            pat_info.get("company_id", ""),
-        )
-        logger.info(
-            "repo_scan (local): MCP JSON-RPC/streamable URL=%s | auth=%s | "
-            "Lineaje HTTP + MCP POSTs logged under logger 'scan_common'",
-            mcp_server_url,
-            lineaje_native_auth_log_label(
-                args,
-                mcp_cfg_fallback_bearer=mcp_cfg.get("bearer_token", ""),
-                mcp_cfg_refresh_token=mcp_cfg.get("refresh_token", ""),
-            ),
-        )
-    except Exception as exc:
-        logger.error("Cannot resolve MCP bearer token: %s", exc)
-        if device_code_effective(args):
-            logger.error(
-                "Device code: complete the browser / device-login approval, then wait — "
-                "the CLI polls for up to LINEAJE_DEVICE_CODE_POLL_TIMEOUT_SEC (default 300s)."
-            )
-        elif _refresh_token_effective_with_mcp_file(
-            args,
-            _mcp_refresh_from_file_when_no_bearer(
-                mcp_cfg.get("bearer_token", ""),
-                mcp_cfg.get("refresh_token", ""),
-            ),
-        )[0]:
-            logger.error(
-                "Refresh token: renew-access-token failed — use a new refresh token "
-                "or --device-code for a fresh native login."
-            )
-        return 2
-
-    scan_start = time.perf_counter()
-
-    # ---- Step 1: Detect project metadata ----
-    logger.info("=" * 60)
-    logger.info("STEP 1: Detect project metadata")
-    logger.info("=" * 60)
-    step_start = time.perf_counter()
-
-    # For local/IDE/CLI scans: only use git remote URL when the caller explicitly
-    # provides --repo-url or SOURCE_CODE_REPO. Otherwise always use local://<name>
-    # so the report never shows a GitHub link for a local scan.
-    explicit_repo_url = args.repo_url or os.environ.get("SOURCE_CODE_REPO", "")
-    branch_override = args.branch or os.environ.get("REPO_BRANCH", "")
-
-    _, detected_branch, head_sha = detect_project_metadata(
-        local_path,
-        repo_url_override="",   # intentionally ignore git remote
-        branch_override=branch_override,
-    )
-
-    if explicit_repo_url:
-        source_code_repo = explicit_repo_url
-    else:
-        source_code_repo = (
-            f"local://{canonicalize_project_name(pathlib.Path(local_path).resolve().name)}"
-        )
-
-    branch = branch_override or detected_branch or "local"
-
-    # Also surface all manifest files found (logged for visibility)
-    manifests = collect_manifest_files(local_path)
-    if manifests:
-        logger.info("Manifest files found (%d): %s", len(manifests), ", ".join(manifests[:10]))
-
-    run_id = time.strftime("%Y%m%d_%H%M%S")
-    step_start = _log_step_timing("STEP 1: Detect project metadata", step_start, scan_start)
-
-    # ---- Step 2: Collect scannable files ----
-    logger.info("=" * 60)
-    logger.info("STEP 2: Collect scannable files from %s", local_path)
-    logger.info("=" * 60)
-    step_start = time.perf_counter()
-    file_list, skill_paths = collect_scannable_files(local_path)
-    if skill_paths:
-        logger.info("Skill manifests included in local scan: %d", len(skill_paths))
-    if not file_list:
-        logger.info("No scannable files found in %s", local_path)
-        result = {"report": "No scannable files found.", "remediation_actions": []}
-        if args.output_json:
-            print(json.dumps(result, indent=2))
-        else:
-            print(result["report"])
-        _log_step_timing("STEP 2: Collect scannable files (none found)", step_start, scan_start)
-        return 0
-
-    batches = [
-        file_list[i: i + MAX_ARCHIVE_FILES]
-        for i in range(0, len(file_list), MAX_ARCHIVE_FILES)
-    ]
-    logger.info(
-        "Found %d scannable files → %d batch(es) of ≤%d files",
-        len(file_list), len(batches), MAX_ARCHIVE_FILES,
-    )
-    step_start = _log_step_timing("STEP 2: Collect scannable files", step_start, scan_start)
-
-    # ---- Step 3: MCP scan (batched) ----
-    logger.info("=" * 60)
-    logger.info("STEP 3: MCP scan (%d batch(es))", len(batches))
-    logger.info("=" * 60)
-
-    logger.info(
-        "repo_scan (local): starting MCP batches → POST %s (tools/call get_upload_url, analyze_uploaded_archive)",
-        mcp_server_url,
-    )
-
-    all_remediation_actions: List[Dict[str, Any]] = []
-    all_reports: List[str] = []
-    # Maps violated filename → archive path of the batch that detected it
-    violation_archive: Dict[str, str] = {}
-
-    import tempfile
-    with tempfile.TemporaryDirectory(prefix="unifai-local-scan-") as temp_dir:
-        logger.info("Running %d batch(es) in parallel (max %d workers)", len(batches), 4)
-        step_start = time.perf_counter()
-        all_remediation_actions, all_reports, violation_archive, last_archive_path, failed_batches, mcp_failure_details = (
-            parallel_batch_scan(
-                batches=batches,
-                root_dir=local_path,
-                temp_dir=temp_dir,
-                source_code_repo=source_code_repo,
-                branch=branch,
-                head_sha=head_sha,
-                run_id=run_id,
-                mcp_server_url=mcp_server_url,
-                get_mcp_bearer_token=get_mcp_bearer,
-                create_archive_fn=partial(create_batch_archive, skill_paths=skill_paths),
-            )
-        )
-
-        report = "\n\n".join(all_reports)
-        remediation_actions = all_remediation_actions
-        archive_path = last_archive_path
-
-        logger.info(
-            "MCP scan complete: %d total violations across %d batch(es)",
-            len(remediation_actions), len(batches),
-        )
-        step_start = _log_step_timing("STEP 3: MCP scan", step_start, scan_start)
-
-        # ---- Step 4: Output ----
-
-        # --output-json: return raw MCP results for Cursor to consume
-        if args.output_json:
-            result = {
-                "report": report,
-                "remediation_actions": remediation_actions,
-                "meta": {
-                    "source_code_repo": source_code_repo,
-                    "branch": branch,
-                    "local_path": local_path,
-                    "files_scanned": len(file_list),
-                    "manifests": manifests,
-                    "failed_batches": failed_batches,
-                    "mcp_batch_failure_details": mcp_failure_details,
-                },
-            }
-            print(json.dumps(result, indent=2))
-            logger.info(
-                "Timing — local scan finished: %.1fs total",
-                time.perf_counter() - scan_start,
-            )
-            return 1 if failed_batches else 0
-
-        if failed_batches:
-            logger.error(
-                "MCP scan incomplete: %d of %d batch(es) failed",
-                failed_batches, len(batches),
-            )
-            if mcp_failure_details:
-                logger.error(
-                    "MCP batch failure detail:\n%s",
-                    "\n".join(mcp_failure_details),
-                )
-            logger.error(
-                "MCP server URL (connectivity check): %s",
-                mcp_server_url,
-            )
-            print(
-                "❌ UniFAI scan failed: one or more MCP batches did not complete.\n"
-                + ("\n".join(mcp_failure_details) if mcp_failure_details else ""),
-                file=sys.stderr,
-            )
-            logger.info(
-                "Timing — local scan finished: %.1fs total",
-                time.perf_counter() - scan_start,
-            )
-            return 1
-
-        # No violations
-        if not remediation_actions:
-            print(report or "✅ No policy violations found.")
-            logger.info(
-                "Timing — local scan finished: %.1fs total",
-                time.perf_counter() - scan_start,
-            )
-            return 0
-
-        # Print report in all cases
-        if report:
-            print(report)
-
-        # --apply-fixes: skill renames (deterministic) + optional LLM content fixes
-        if args.apply_fixes and (
-            llm_api_key or has_skill_block_remediation_actions(remediation_actions)
-        ):
-            logger.info("=" * 60)
-            logger.info("STEP 4: Remediation (%d actions)", len(remediation_actions))
-            logger.info("=" * 60)
-            step_start = time.perf_counter()
-            clone_bmap = build_clone_basename_map(local_path)
-            logger.info("Built clone basename map: %d unique basenames", len(clone_bmap))
-
-            def _resolve_local(filepath: str) -> Tuple[Optional[str], Optional[str]]:
-                src_archive = violation_archive.get(filepath, archive_path)
-                return resolve_original_for_remediation(
-                    local_path, src_archive, filepath, file_list,
-                    clone_basename_map=clone_bmap,
-                )
-
-            skill_renames, skill_failed, skill_rows = apply_skill_block_renames(
-                remediation_actions, _resolve_local, root_dir=local_path,
-            )
-            llm_actions = filter_actions_for_llm_remediation(remediation_actions)
-            grouped = group_remediation_by_file(llm_actions)
-            renamed_old = {old for old, _, _ in skill_renames}
-            grouped = {k: v for k, v in grouped.items() if k not in renamed_old}
-
-            validated_fixes: Dict[str, str] = {}
-            if llm_api_key and grouped:
-                logger.info(
-                    "Running LLM remediation for %d file(s) in parallel (max %d workers)",
-                    len(grouped), 5,
-                )
-                validated_fixes, _, _ = parallel_llm_remediation(
-                    grouped=grouped,
-                    resolve_fn=_resolve_local,
-                    llm_api_url=llm_api_url,
-                    llm_api_key=llm_api_key,
-                    llm_model=llm_model,
-                    temp_dir=temp_dir,
-                )
-            step_start = _log_step_timing(
-                "STEP 4: Remediation",
-                step_start, scan_start,
-            )
-
-            written: List[str] = [new for _, new, _ in skill_renames]
-            if validated_fixes:
-                written.extend(_apply_fixes_locally(validated_fixes, local_path))
-            if written:
-                print(f"\n✅ Applied {len(written)} fix(es) directly to {local_path}")
-                print(f"   Originals backed up to: {os.path.join(local_path, 'unifai_backup/')}")
-            elif skill_failed:
-                print(f"\n⚠️  Skill block remediation failed for: {', '.join(skill_failed)}")
-            else:
-                print("\n⚠️  No fixes could be validated — review report above manually.")
-        elif args.apply_fixes and not llm_api_key:
-            logger.warning(
-                "--apply-fixes requires LLM API key for non-skill violations: "
-                "--llm-api-key or LLM_API_KEY / UNIFAI_API_KEY / OPENROUTER_API_KEY env",
-            )
-
-    logger.info(
-        "Timing — local scan finished: %.1fs total",
-        time.perf_counter() - scan_start,
-    )
-    return 0
-
 
 # ===========================================================================
 # CLI
 # ===========================================================================
 
 def _load_dotenv(dotenv_path: str = ".env", *, override: bool = False) -> None:
-    """Load KEY=VALUE pairs from a .env file into os.environ (no-op if missing).
-
-    When ``override`` is True, file values replace existing variables so checkout
-    ``.env`` wins over stale shell exports (e.g. ``LINEAJE_FETCH_ACCESS_TOKEN_URL``).
-
-    Empty values in the file (e.g. ``MCP_REFRESH_TOKEN=``) do **not** replace a non-empty
-    variable already present in the process environment — so ``export MCP_REFRESH_TOKEN=…``
-    before ``repo_scan.py`` survives placeholder lines in `.env`.
-    """
     try:
         with open(dotenv_path) as f:
             for line in f:
@@ -1613,108 +2043,64 @@ def _load_dotenv(dotenv_path: str = ".env", *, override: bool = False) -> None:
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    if argv is None:
+        argv = sys.argv[1:]
+    # Broken shell continuations (e.g. ``'...' \\  --flag`` on one line) can inject empty
+    # argv words; argparse rejects them as unrecognized "positional" empty tokens.
+    argv = [a for a in argv if a != ""]
+
     parser = argparse.ArgumentParser(
-        description="UniFAI Repository Scanner — scan full repositories for AI policy compliance",
+        description="Veracode Repository Scanner — AI policy compliance scan with JSON output",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--provider", default="", choices=["github", "bitbucket", "gitlab"],
-                        help="SCM provider (or env SCM_PROVIDER, default: github)")
-    parser.add_argument("--repo", default="",
-                        help="Repository owner/repo (or env REPO_REPO)")
-    parser.add_argument("--branch", default="",
-                        help="Branch to scan (or env REPO_BRANCH)")
+    parser.add_argument("--repo", default="", help="Repository owner/repo (or env REPO_REPO)")
+    parser.add_argument("--branch", default="", help="Branch to scan (or env REPO_BRANCH)")
     parser.add_argument("--source-code-repo", default="",
                         help="Full repo URL for SBOM tracking (or env SOURCE_CODE_REPO)")
     parser.add_argument(
         "--pr-target-repo", default="",
-        help="GitHub owner/repo slug to open remediation PR against (upstream). "
-             "If unset, inferred when SOURCE_CODE_REPO names a repo different from --repo "
-             "(fork scans). Env: PR_TARGET_REPO.",
+        help="GitHub owner/repo to open remediation PR against (upstream). "
+             "Inferred when SOURCE_CODE_REPO differs from --repo unless set. Env: PR_TARGET_REPO.",
     )
-    parser.add_argument("--pr", type=int, default=None,
-                        help="Existing remediation PR number to check (skip scan if exists)")
-
-    # Auth — prefer env vars in CI, CLI args for local testing
-    parser.add_argument("--scm-token", default="", help="SCM access token (or env SCM_ACCESS_TOKEN)")
-    parser.add_argument("--scm-base-url", default="", help="SCM API base URL (auto-detected from provider)")
-    parser.add_argument("--mcp-server-url", default="", help="MCP server URL (or env MCP_SERVER_URL)")
-    #parser.add_argument("--mcp-bearer-token", default="", help="MCP bearer token (or env MCP_BEARER_TOKEN)")
-    parser.add_argument(
-        "--device-code", default="",
-        help="Native auth device code — exchanges for access/refresh tokens (or env MCP_DEVICE_CODE / DEVICE_CODE). "
-             "Do not use together with --refresh-token.",
-    )
-    parser.add_argument(
-        "--refresh-token", default="", dest="refresh_token",
-        help="Native refresh token — POSTs to renew-access-token only (or env MCP_REFRESH_TOKEN / LINEAJE_REFRESH_TOKEN). "
-             "Do not use together with --device-code.",
-    )
+    parser.add_argument("--scm-token", default="", help="GitHub PAT (or env SCM_ACCESS_TOKEN)")
+    parser.add_argument("--refresh-token", default="", dest="refresh_token",
+                        help="MCP refresh token (or env MCP_REFRESH_TOKEN / LINEAJE_REFRESH_TOKEN).")
     parser.add_argument(
         "--lineaje-pat", default="", dest="lineaje_pat",
-        help="Lineaje PAT token used directly as MCP bearer (or env LINEAJE_PAT_TOKEN). Takes priority over device-code and bearer-token.",
+        help="Lineaje PAT token used directly as MCP bearer (or env LINEAJE_PAT_TOKEN). Takes priority over bearer-token.",
     )
-    parser.add_argument("--llm-api-key", default="", help="LLM API key (or LLM_API_KEY / UNIFAI_API_KEY / OPENROUTER_API_KEY env)")
-    parser.add_argument("--llm-model", default="", help=f"LLM model (or LLM_MODEL / UNIFAI_REMED_MODEL / UNIFAI_EVAL_MODEL env, default: {DEFAULT_LLM_MODEL})")
-    parser.add_argument("--llm-api-url", default="", help=f"LLM API URL (or LLM_API_URL / UNIFAI_EVAL_SERVER_URL; default: {DEFAULT_LLM_API_URL})")
-
+    parser.add_argument("--mcp-server-url", default="",
+                        help="MCP server URL (overrides default prod URL; or env MCP_SERVER_URL).")
+    parser.add_argument(
+        "--llm-api-key", default="",
+        help="LLM API key for local remediation (or env LLM_API_KEY / UNIFAI_API_KEY / OPENROUTER_API_KEY)",
+    )
+    parser.add_argument(
+        "--llm-model", default="",
+        help="LLM model for remediation (or env after built-in priority; see scripts/scan_common.resolve_llm_model)",
+    )
+    parser.add_argument(
+        "--llm-api-url", default="",
+        help="LLM API base URL (or env LLM_API_URL / UNIFAI_EVAL_SERVER_URL; default: OpenRouter)",
+    )
     _rem = parser.add_mutually_exclusive_group()
     _rem.add_argument(
         "--run-remediation-mcp",
         dest="run_remediation_mcp",
         action="store_const",
         const=True,
-        help="Force LLM remediation + remediation PR (remote mode; default is on).",
+        help="Force local LLM remediation + PR creation on (default is on when LLM_API_KEY is set).",
     )
     _rem.add_argument(
         "--no-run-remediation-mcp",
         dest="run_remediation_mcp",
         action="store_const",
         const=False,
-        help="Skip LLM + remediation PR (overrides LINEAJE_RUN_REMEDIATION_MCP_TOOL constant in this file).",
+        help="Skip LLM remediation + PR creation (overrides LINEAJE_RUN_REMEDIATION_MCP_TOOL constant).",
     )
     parser.set_defaults(run_remediation_mcp=None)
-
-    # Scan tuning
-    parser.add_argument("--max-archive-size", type=int, default=DEFAULT_MAX_ARCHIVE_SIZE_MB,
-                        help=f"Maximum archive size in MB (default: {DEFAULT_MAX_ARCHIVE_SIZE_MB})")
-    parser.add_argument("--clone-timeout", type=int, default=DEFAULT_CLONE_TIMEOUT,
-                        help=f"Git clone timeout in seconds (default: {DEFAULT_CLONE_TIMEOUT})")
-
-    # Local / IDE / CLI mode (no clone, no SCM token required)
-    parser.add_argument(
-        "--local-path", default="",
-        help="Scan a local directory instead of cloning. Skips all SCM operations.",
-    )
-    parser.add_argument(
-        "--repo-url", default="",
-        help="Override the detected source_code_repo URL (useful when no .git exists).",
-    )
-    parser.add_argument(
-        "--apply-fixes", action="store_true",
-        help="Write LLM-generated fixes directly to local files (local mode only).",
-    )
-    parser.add_argument(
-        "--output-json", action="store_true",
-        help="Print {report, remediation_actions} as JSON to stdout and exit. "
-             "No LLM call, no file writes — intended for IDE consumption (e.g. Cursor).",
-    )
-
-    # Logging
-    parser.add_argument(
-        "--log-full-mcp-bearer",
-        action="store_true",
-        help="INSECURE: full MCP JWT at INFO is already the default; flag forces LINEAJE_LOG_FULL_MCP_BEARER_TOKEN=1.",
-    )
-    parser.add_argument(
-        "--log-file",
-        default="",
-        metavar="PATH",
-        help="Append all logs to this UTF-8 text file (sets LINEAJE_LOG_FILE for this process). "
-             "Parent dirs are created. Env: LINEAJE_LOG_FILE or AIPO_LOG_FILE.",
-    )
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging")
-
     return parser.parse_args(argv)
 
 
@@ -1723,26 +2109,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     _load_dotenv(str(_repo_env), override=True)
     _load_dotenv(override=True)
     args = parse_args(argv)
-    if getattr(args, "log_full_mcp_bearer", False):
-        os.environ["LINEAJE_LOG_FULL_MCP_BEARER_TOKEN"] = "0"
-    _log_file_cli = (getattr(args, "log_file", None) or "").strip()
-    if _log_file_cli:
-        os.environ["LINEAJE_LOG_FILE"] = _log_file_cli
 
-    _mcp_for_log = (args.mcp_server_url or os.environ.get("MCP_SERVER_URL", "")).strip()
-    if not _mcp_for_log:
-        _mcp_for_log = (load_mcp_config().get("server_url") or "").strip()
-    from env_loader import (
-        attach_lineaje_log_file_to_root,
-        ensure_default_lineaje_scan_log_file_for_remote_mcp,
-    )
-
-    ensure_default_lineaje_scan_log_file_for_remote_mcp(
-        scanner_name="repo_scan",
-        mcp_server_url=_mcp_for_log,
-    )
-
-    # Configure logging first so all paths can use it
     level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(
         level=level,
@@ -1751,31 +2118,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         stream=sys.stderr,
     )
 
-    attach_lineaje_log_file_to_root(announce=logger)
-
-    apply_llm_os_environ_defaults(_mcp_for_log)
-    log_effective_llm_remediation_config(logger)
-
-    # -----------------------------------------------------------------------
-    # LOCAL MODE — triggered by --local-path (IDE / CLI / no-git environments)
-    # The entire existing remote/_execute_scan() path is untouched.
-    # -----------------------------------------------------------------------
-    local_path = args.local_path or os.environ.get("LOCAL_PATH", "")
-    if local_path:
-        args.local_path = local_path
-        logger.info("UniFAI Repository Scanner — LOCAL mode: %s", local_path)
-        start = time.time()
-        try:
-            exit_code = _execute_local_scan(args)
-        except Exception:
-            logger.exception("Unhandled error in local scan")
-            exit_code = 1
-        logger.info("Completed in %.1fs with exit code %d", time.time() - start, exit_code)
-        return exit_code
-
-    # -----------------------------------------------------------------------
-    # REMOTE MODE — original behaviour, completely unchanged
-    # -----------------------------------------------------------------------
     if not args.repo:
         args.repo = os.environ.get("REPO_REPO", "")
     if not args.branch:
@@ -1785,27 +2127,25 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not args.pr_target_repo:
         args.pr_target_repo = os.environ.get("PR_TARGET_REPO", "")
 
-    missing = [n for n, v in [
-        ("--repo / REPO_REPO", args.repo),
-        ("--branch / REPO_BRANCH", args.branch),
-    ] if not v]
+    missing = [n for n, v in [("--repo / REPO_REPO", args.repo), ("--branch / REPO_BRANCH", args.branch)] if not v]
     if missing:
-        print(f"error: missing required arguments: {', '.join(missing)}", file=sys.stderr)
+        err = {"status": "error", "scan_errors": [f"Missing required arguments: {', '.join(missing)}"]}
+        print(json.dumps(err, indent=2))
         return 2
 
-    logger.info("UniFAI Repository Scanner starting")
-    logger.info("  Repo:     %s", args.repo)
-    logger.info("  Branch:   %s", args.branch)
-    logger.info("  Provider: %s", args.provider or os.environ.get("SCM_PROVIDER", "github"))
+    logger.info("Veracode Repository Scanner starting")
+    logger.info("  Repo:   %s", args.repo)
+    logger.info("  Branch: %s", args.branch)
 
     start = time.time()
     try:
         exit_code = _execute_scan(args)
-    except Exception as exc:
+    except Exception:
         logger.exception("Unhandled error in repository scan")
+        err = {"status": "error", "scan_errors": ["Unhandled exception — see stderr logs"]}
+        print(json.dumps(err, indent=2))
         exit_code = 1
-    elapsed = time.time() - start
-    logger.info("Completed in %.1fs with exit code %d", elapsed, exit_code)
+    logger.info("Completed in %.1fs with exit code %d", time.time() - start, exit_code)
     return exit_code
 
 
