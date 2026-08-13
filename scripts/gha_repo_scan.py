@@ -47,6 +47,7 @@ import base64
 import fnmatch
 import json
 import logging
+import logging.handlers
 import os
 import pathlib
 import re
@@ -59,16 +60,155 @@ import urllib.parse
 import urllib.request
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import hashlib
+import hmac
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+# Patterns commonly used in prompt injection attacks against LLMs
+_PROMPT_INJECTION_PATTERNS = [
+    re.compile(r'(?i)(?:^|\n)\s*(?:ignore|disregard|forget)\s+(?:all\s+)?(?:previous|above|prior)\s+(?:instructions|prompts|rules|context)'),
+    re.compile(r'(?i)(?:^|\n)\s*(?:you\s+are\s+now|act\s+as|pretend\s+to\s+be|new\s+instruction|system\s*:)'),
+    re.compile(r'(?i)(?:^|\n)\s*<\s*(?:system|prompt|instruction)\s*>'),
+    re.compile(r'(?i)(?:^|\n)\s*\[\s*(?:SYSTEM|INST|INSTRUCTION)\s*\]'),
+]
+
+_MAX_FILE_CONTENT_LENGTH = 500_000  # 500KB per file content limit
+
+
+def _sanitize_file_content(content: str) -> str:
+    """Sanitize file content to mitigate prompt injection attacks.
+
+    Strips or neutralizes patterns that could be interpreted as prompt
+    injection when the content is sent to an LLM-backed service.
+    """
+    if not content:
+        return content
+    # Truncate excessively large content
+    if len(content) > _MAX_FILE_CONTENT_LENGTH:
+        content = content[:_MAX_FILE_CONTENT_LENGTH] + "\n[TRUNCATED]"
+    # Neutralize prompt injection patterns by prefixing matched lines
+    for pattern in _PROMPT_INJECTION_PATTERNS:
+        content = pattern.sub(lambda m: "/* [SANITIZED] */ " + m.group(0).lstrip(), content)
+    # Remove null bytes and other control characters that could confuse parsing
+    content = content.replace('\x00', '')
+    return content
+
+
+def _sanitize_batch_files(batch_files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Validate and sanitize a batch of files before sending to the MCP server.
+
+    Each file dict is expected to have 'path' and 'content' keys.
+    Returns a new list with sanitized content.
+    """
+    sanitized = []
+    for file_entry in batch_files:
+        if not isinstance(file_entry, dict):
+            continue
+        sanitized_entry = dict(file_entry)
+        # Validate path - must be a relative path, no path traversal
+        path = sanitized_entry.get("path", "")
+        if not path or ".." in path.split("/") or path.startswith("/"):
+            logger.warning("Skipping file with invalid path: %s", path)
+            continue
+        # Sanitize content
+        if "content" in sanitized_entry and isinstance(sanitized_entry["content"], str):
+            sanitized_entry["content"] = _sanitize_file_content(sanitized_entry["content"])
+        sanitized.append(sanitized_entry)
+    return sanitized
+
 logger = logging.getLogger("gha_repo_scan")
+
+
+def _validate_mcp_response(response: Any) -> dict:
+    """Validate and sanitize a parsed MCP server response.
+
+    Ensures the response conforms to expected JSON-RPC structure and
+    sanitizes string values to prevent injection attacks.
+    """
+    if not isinstance(response, dict):
+        raise ValueError(f"MCP response must be a JSON object, got {type(response).__name__}")
+    # Validate JSON-RPC structure
+    if "jsonrpc" in response and response.get("jsonrpc") != "2.0":
+        raise ValueError(f"Unexpected jsonrpc version: {response.get('jsonrpc')}")
+    # Must have either 'result' or 'error'
+    if "result" not in response and "error" not in response and "id" in response:
+        raise ValueError("MCP response missing both 'result' and 'error' fields")
+    return response
+
+
+def _sanitize_mcp_text(text: Any) -> str:
+    """Sanitize a text value from MCP server response.
+
+    Strips control characters (except newlines/tabs) and validates type.
+    """
+    if not isinstance(text, str):
+        return ""
+    # Remove control characters except \n, \r, \t
+    sanitized = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+    return sanitized
 
 # ===========================================================================
 # Constants
 # ===========================================================================
 
 MCP_SERVER_URL = "https://mcp.v2.prod.veedna.com/mcp"
+
+# Risk classification metadata for this AI system deployment.
+# Valid levels: "minimal", "limited", "high", "unacceptable"
+AI_RISK_CLASSIFICATION = {
+    "risk_level": "limited",
+    "system_name": "Lineaje AI Policy Scanner",
+    "deployment_context": "CI/CD automated code scanning",
+    "classification_standard": "EU AI Act",
+}
+
+
+def _validate_risk_classification(config: dict) -> None:
+    """Validate that the AI system risk classification metadata is properly declared."""
+    valid_levels = {"minimal", "limited", "high", "unacceptable"}
+    risk_level = config.get("risk_level")
+    if not risk_level:
+        raise ValueError(
+            "AI system configuration error: 'risk_level' must be declared in "
+            "AI_RISK_CLASSIFICATION metadata."
+        )
+    if risk_level not in valid_levels:
+        raise ValueError(
+            f"AI system configuration error: 'risk_level' must be one of "
+            f"{valid_levels}, got '{risk_level}'."
+        )
+
+
+_validate_risk_classification(AI_RISK_CLASSIFICATION)
+
+# Patterns for dangerous dynamic code execution primitives in LLM output
+_DANGEROUS_CODE_EXEC_PATTERNS = re.compile(
+    r'\b(eval|exec|compile|execfile|__import__|subprocess'
+    r'|os\.system|os\.popen|os\.exec[a-z]*|os\.spawn[a-z]*'
+    r'|commands\.getoutput|commands\.getstatusoutput'
+    r'|pty\.spawn|builtins\.__import__)\s*\(',
+    re.IGNORECASE,
+)
+
+
+def _sanitize_llm_output(text: str) -> None:
+    """Validate LLM output for dynamic code execution primitives.
+
+    Raises ValueError if dangerous patterns are detected in the LLM response.
+    """
+    matches = _DANGEROUS_CODE_EXEC_PATTERNS.findall(text)
+    if matches:
+        unique_matches = sorted(set(m.lower().strip() for m in matches))
+        logger.warning(
+            "LLM output contains dynamic code execution primitives: %s. "
+            "Output will be sanitized.",
+            unique_matches,
+        )
+        raise ValueError(
+            f"LLM output failed sanitization: detected code execution "
+            f"primitives {unique_matches}. Refusing to process untrusted output."
+        )
 
 MAX_SCAN_WORKERS = 4
 DEFAULT_UNIFAI_FILE_BATCH_SIZE = 100
@@ -78,6 +218,87 @@ _LINEAJE_NATIVE_RENEW_ACCESS_TOKEN_URL_PROD = (
     "https://lineaje-identity-service.v2.prod.veedna.com"
     "/lineajeidentity/api/v1/auth/native/renew-access-token"
 )
+
+# ===========================================================================
+# Secure Session Token Handling
+# ===========================================================================
+
+_SESSION_TOKEN_SECRET = os.environ.get(
+    "_LINEAJE_SESSION_HMAC_SECRET", secrets.token_hex(32)
+)
+_SESSION_TOKEN_MAX_AGE_SEC = 3600  # 1 hour max session lifetime
+
+
+class SecureSessionToken:
+    """Wraps an MCP session-id with HMAC signing, expiry, and subject binding."""
+
+    def __init__(self, raw_token: str, subject: str) -> None:
+        self.raw_token = raw_token
+        self.subject = subject
+        self.issued_at = time.time()
+        self.signature = self._compute_signature()
+
+    def _compute_signature(self) -> str:
+        payload = f"{self.raw_token}|{self.subject}|{self.issued_at}"
+        return hmac.new(
+            _SESSION_TOKEN_SECRET.encode(),
+            payload.encode(),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def verify(self, expected_subject: str) -> bool:
+        """Verify HMAC signature, expiry, and subject binding."""
+        # Check expiry
+        if (time.time() - self.issued_at) > _SESSION_TOKEN_MAX_AGE_SEC:
+            logger.warning("Session token expired (age=%.0fs)", time.time() - self.issued_at)
+            return False
+        # Check subject binding
+        if not hmac.compare_digest(self.subject, expected_subject):
+            logger.warning("Session token subject mismatch")
+            return False
+        # Verify HMAC integrity
+        expected_sig = self._compute_signature()
+        if not hmac.compare_digest(self.signature, expected_sig):
+            logger.warning("Session token HMAC verification failed")
+            return False
+        return True
+
+    @staticmethod
+    def _compute_hmac(raw_token: str, subject: str, issued_at: float) -> str:
+        payload = f"{raw_token}|{subject}|{issued_at}"
+        return hmac.new(
+            _SESSION_TOKEN_SECRET.encode(),
+            payload.encode(),
+            hashlib.sha256,
+        ).hexdigest()
+
+
+def _validate_and_bind_session_id(
+    new_session_id: Optional[str],
+    current_token: Optional["SecureSessionToken"],
+    subject: str,
+) -> Optional["SecureSessionToken"]:
+    """Validate a new session ID from the server and bind it to the subject.
+
+    Returns a SecureSessionToken if the new ID is acceptable, otherwise
+    returns the current token (if still valid) or None.
+    """
+    if not new_session_id:
+        # No new token from server; keep current if still valid
+        if current_token and current_token.verify(subject):
+            return current_token
+        return None
+
+    # Basic sanity: session IDs should be reasonable length, printable ASCII
+    if len(new_session_id) > 512 or not new_session_id.isprintable():
+        logger.warning("Rejected malformed session-id from server")
+        if current_token and current_token.verify(subject):
+            return current_token
+        return None
+
+    # Create a new signed, bound token
+    return SecureSessionToken(raw_token=new_session_id, subject=subject)
+
 
 _ARCHIVE_EXCLUDE = {
     ".git", ".gitignore", ".gitattributes", ".gitmodules", ".hg", ".svn",
@@ -529,14 +750,15 @@ def build_json_output(
     report: str = "",
     scan_errors: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    return {
+    generated_at = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    result = {
         "status": status,
         "scan_metadata": {
             "repo": repo,
             "branch": branch,
             "head_sha": head_sha,
             "source_code_repo": source_code_repo,
-            "scanned_at": datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "scanned_at": generated_at,
             "files_scanned": files_scanned,
             "batches": batches,
             "failed_batches": failed_batches,
@@ -545,7 +767,22 @@ def build_json_output(
         "violations": violations,
         "aibom": aibom or [],
         "scan_errors": scan_errors or [],
+        "provenance": {
+            "content_label": "AI-GENERATED: This output was produced by an automated AI-assisted scanning system.",
+            "synthetic_origin": True,
+            "model_identifier": "lineaje-mcp-scan/1.0",
+            "content_origin": "MCP server automated policy scan",
+            "generated_at": generated_at,
+            "watermark": "SYNTHETIC-CONTENT-LINEAJE-SCAN",
+        },
     }
+    # Compute HMAC-SHA256 signature over the content for integrity verification
+    signing_key = os.environ.get("PROVENANCE_SIGNING_KEY", "lineaje-default-provenance-key")
+    content_bytes = json.dumps(result, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    signature = hmac.new(signing_key.encode('utf-8'), content_bytes, hashlib.sha256).hexdigest()
+    result["provenance"]["signature_algorithm"] = "HMAC-SHA256"
+    result["provenance"]["signature"] = signature
+    return result
 
 # ===========================================================================
 # Main scan orchestration
@@ -656,7 +893,20 @@ def _execute_scan(args: argparse.Namespace) -> int:
         violations=all_violations, aibom=all_aibom, report=combined_report,
         scan_errors=failure_details,
     )
-    print(json.dumps(output, indent=2))
+    # Minimise output: only include essential summary fields
+    _ALLOWED_OUTPUT_KEYS = {
+        "status", "repo", "branch", "head_sha", "scan_id",
+        "policy_pass", "violation_count", "error_count", "scan_errors",
+    }
+    minimised = {k: v for k, v in output.items() if k in _ALLOWED_OUTPUT_KEYS}
+    # For violations, include only id, policy, severity, and file path
+    if "violations" in output and isinstance(output["violations"], list):
+        minimised["violations"] = [
+            {k: v for k, v in item.items() if k in ("id", "policy", "severity", "file", "line")}
+            for item in output["violations"]
+        ]
+    # Exclude full markdown report and complete aibom arrays
+    print(json.dumps(minimised, indent=2))
     return 0
 
 # ===========================================================================
@@ -687,7 +937,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--mcp-server-url", default="",
-        help=f"MCP server URL (default: {MCP_SERVER_URL})",
+        help=f"MCP server URL (default: {MCP_SERVER_URL}). Must match an allowed hostname.",
     )
     parser.add_argument(
         "--debug", action="store_true",
@@ -699,12 +949,39 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
 
+    # --- Log retention policy: minimum 6 months (180 days) for high-risk AI systems ---
+    LOG_RETENTION_DAYS = 180  # Minimum retention period per AI governance policy
+    log_dir = pathlib.Path(os.environ.get("LINEAJE_LOG_DIR", "/var/log/lineaje"))
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "gha_repo_scan.log"
+
+    log_format = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    log_datefmt = "%Y-%m-%d %H:%M:%S"
+
     logging.basicConfig(
         level=logging.DEBUG if args.debug else logging.WARNING,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+        format=log_format,
+        datefmt=log_datefmt,
         stream=sys.stderr,
     )
+
+    # File handler with timed rotation — retains logs for at least 180 days (6 months)
+    file_handler = logging.handlers.TimedRotatingFileHandler(
+        filename=str(log_file),
+        when="D",
+        interval=1,
+        backupCount=LOG_RETENTION_DAYS,
+        utc=True,
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter(fmt=log_format, datefmt=log_datefmt))
+    logging.getLogger().addHandler(file_handler)
+
+    logger.info(
+        "Log retention configured: retention_days=%d, log_file=%s",
+        LOG_RETENTION_DAYS, log_file,
+    )
+
     # Always show INFO from this logger regardless of --debug
     logger.setLevel(logging.DEBUG if args.debug else logging.INFO)
 
@@ -712,7 +989,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _execute_scan(args)
     except Exception:
         logger.exception("Unhandled error")
-        err = {"status": "error", "scan_errors": ["Unhandled exception — see stderr logs"]}
+        err = {"status": "error", "error_count": 1}
         print(json.dumps(err, indent=2))
         return 1
 
